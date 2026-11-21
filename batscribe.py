@@ -140,6 +140,104 @@ def collect(inputs):
     return sorted(set(vids), key=lambda v: str(v).lower())
 
 
+def error_log_path(first_input) -> Path:
+    root = Path(str(first_input).strip('"'))
+    return (root if root.is_dir() else root.parent) / "batscribe_errors.log"
+
+
+def keep_awake(on: bool):
+    """Stop Windows from sleeping while this thread runs a batch (the screen may still turn off)."""
+    if os.name == "nt":
+        import ctypes
+        es_continuous, es_system_required = 0x80000000, 0x00000001
+        ctypes.windll.kernel32.SetThreadExecutionState(es_continuous | (es_system_required if on else 0))
+
+
+def run_batch(todo, durations, log_path, model_name="large-v3-turbo", compute_type="int8_float16",
+              on_event=lambda kind, **info: None, should_stop=lambda: False):
+    """Transcribe each video in `todo`, reporting through on_event(kind, **info).
+
+    Events: loading, start, progress, done, failed, finished. A stop request abandons
+    the current file (no .srt is written for it). Returns the number of failures.
+    """
+    total_audio = sum(durations.values())
+    keep_awake(True)
+    try:
+        add_cuda_dll_dirs()
+        from faster_whisper import WhisperModel
+        on_event("loading", model=model_name)
+        model = WhisperModel(model_name, device="cuda", compute_type=compute_type)
+
+        done_audio, ok, failures, stopped = 0.0, 0, 0, False
+        t0 = time.time()
+        for n, vid in enumerate(todo, 1):
+            if should_stop():
+                stopped = True
+                break
+            dur = durations[vid]
+            on_event("start", n=n, total=len(todo), video=vid, duration=dur)
+            try:
+                audio = load_audio(vid)
+                segments, info = model.transcribe(
+                    audio, language="en", vad_filter=True, word_timestamps=True,
+                    condition_on_previous_text=False, beam_size=5,
+                )
+                dur = info.duration or dur
+                words = []
+                for seg in segments:
+                    if should_stop():
+                        stopped = True
+                        break
+                    words.extend(seg.words or [])
+                    elapsed = time.time() - t0
+                    processed = done_audio + seg.end
+                    speed = processed / elapsed if elapsed > 0 else 0
+                    on_event("progress", n=n, video=vid,
+                             file_pct=100 * seg.end / dur if dur else 0,
+                             overall_pct=100 * processed / max(total_audio, 1),
+                             speed=speed,
+                             eta=(total_audio - processed) / speed if speed > 0 else 0)
+                if stopped:
+                    break
+                srt = vid.with_suffix(".srt")
+                write_srt(build_cues(words), srt)
+                ok += 1
+                on_event("done", n=n, video=vid, srt=srt)
+            except Exception as e:
+                failures += 1
+                on_event("failed", n=n, video=vid, error=str(e))
+                with open(log_path, "a", encoding="utf-8") as log:
+                    log.write(f"[{dt.datetime.now():%Y-%m-%d %H:%M}] {vid}\n{traceback.format_exc()}\n")
+            done_audio += durations[vid]
+
+        on_event("finished", ok=ok, failed=failures, stopped=stopped,
+                 elapsed=time.time() - t0, log_path=log_path)
+        return failures
+    finally:
+        keep_awake(False)
+
+
+def print_event(kind, **e):
+    if kind == "loading":
+        print(f"Loading model {e['model']} on GPU ...")
+    elif kind == "start":
+        print(f"\n[{e['n']}/{e['total']}] {e['video'].name}  ({fmt_dur(e['duration'])})")
+    elif kind == "progress":
+        print(f"\r   {e['file_pct']:5.1f}%  | overall {e['overall_pct']:5.1f}%"
+              f"  | {e['speed']:4.1f}x realtime | ETA {fmt_dur(e['eta'])}   ", end="", flush=True)
+    elif kind == "done":
+        print(f"\r   done -> {e['srt'].name}" + " " * 40)
+    elif kind == "failed":
+        print(f"\n   FAILED: {e['error']}")
+    elif kind == "finished":
+        print(f"\nFinished in {fmt_dur(e['elapsed'])}. {e['ok']} ok, {e['failed']} failed.")
+        if e["failed"]:
+            print(f"See {e['log_path']}")
+        if os.name == "nt":
+            import winsound
+            winsound.MessageBeep(winsound.MB_ICONASTERISK)
+
+
 def main():
     for stream in (sys.stdout, sys.stderr):
         stream.reconfigure(encoding="utf-8", errors="replace")
@@ -158,54 +256,14 @@ def main():
         return 0
 
     durations = {v: video_duration(v) for v in todo}
-    total_audio = sum(durations.values())
-    print(f"Audio to transcribe: {fmt_dur(total_audio)}")
+    print(f"Audio to transcribe: {fmt_dur(sum(durations.values()))}")
 
-    add_cuda_dll_dirs()
-    from faster_whisper import WhisperModel
-    print(f"Loading model {args.model} on GPU ...")
-    model = WhisperModel(args.model, device="cuda", compute_type=args.compute_type)
-
-    root = Path(args.inputs[0].strip('"'))
-    log_path = (root if root.is_dir() else root.parent) / "batscribe_errors.log"
-    done_audio, failures = 0.0, 0
-    t0 = time.time()
-
-    for n, vid in enumerate(todo, 1):
-        dur = durations[vid]
-        print(f"\n[{n}/{len(todo)}] {vid.name}  ({fmt_dur(dur)})")
-        try:
-            audio = load_audio(vid)
-            segments, info = model.transcribe(
-                audio, language="en", vad_filter=True, word_timestamps=True,
-                condition_on_previous_text=False, beam_size=5,
-            )
-            dur = info.duration or dur
-            words = []
-            for seg in segments:
-                words.extend(seg.words or [])
-                elapsed = time.time() - t0
-                processed = done_audio + seg.end
-                speed = processed / elapsed if elapsed > 0 else 0
-                eta = (total_audio - processed) / speed if speed > 0 else 0
-                pct = 100 * seg.end / dur if dur else 0
-                print(f"\r   {pct:5.1f}%  | overall {100 * processed / max(total_audio, 1):5.1f}%"
-                      f"  | {speed:4.1f}x realtime | ETA {fmt_dur(eta)}   ", end="", flush=True)
-            write_srt(build_cues(words), vid.with_suffix(".srt"))
-            print(f"\r   done -> {vid.with_suffix('.srt').name}" + " " * 40)
-        except KeyboardInterrupt:
-            print("\nStopped. Rerun to continue where you left off.")
-            return 130
-        except Exception as e:
-            failures += 1
-            print(f"\n   FAILED: {e}")
-            with open(log_path, "a", encoding="utf-8") as log:
-                log.write(f"[{dt.datetime.now():%Y-%m-%d %H:%M}] {vid}\n{traceback.format_exc()}\n")
-        done_audio += durations[vid]
-
-    print(f"\nFinished in {fmt_dur(time.time() - t0)}. {len(todo) - failures} ok, {failures} failed.")
-    if failures:
-        print(f"See {log_path}")
+    try:
+        failures = run_batch(todo, durations, error_log_path(args.inputs[0]), args.model, args.compute_type,
+                             on_event=print_event)
+    except KeyboardInterrupt:
+        print("\nStopped. Rerun to continue where you left off.")
+        return 130
     return 1 if failures else 0
 
 
