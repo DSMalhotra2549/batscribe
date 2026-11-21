@@ -105,7 +105,7 @@ def write_srt(cues, out_path: Path):
 def video_duration(path: Path) -> float:
     try:
         out = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
+            ["ffprobe", "-v", "error", "-protocol_whitelist", "file", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
             capture_output=True, text=True, timeout=60,
         ).stdout.strip()
         return float(out)
@@ -117,7 +117,7 @@ def load_audio(path: Path):
     """Decode to 16 kHz mono float32 with ffmpeg (avoids PyAV version breakage)."""
     import numpy as np
     proc = subprocess.run(
-        ["ffmpeg", "-nostdin", "-v", "error", "-i", str(path), "-vn", "-ac", "1", "-ar", "16000",
+        ["ffmpeg", "-nostdin", "-v", "error", "-protocol_whitelist", "file", "-i", str(path), "-vn", "-ac", "1", "-ar", "16000",
          "-f", "f32le", "-"],
         capture_output=True,
     )
