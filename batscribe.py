@@ -6,6 +6,7 @@ Writes <video>.srt next to each video. Existing .srt files are skipped (resumabl
 import argparse
 import datetime as dt
 import os
+import shutil
 import site
 import subprocess
 import sys
@@ -156,6 +157,24 @@ def log_history(line: str):
         f.write(f"{dt.datetime.now():%Y-%m-%d %H:%M:%S}  {line}\n")
 
 
+def check_prerequisites():
+    """Return a list of human-readable problems that would make every video fail."""
+    problems = [f"{tool} was not found. Install ffmpeg and make sure it is on PATH."
+                for tool in ("ffmpeg", "ffprobe") if not shutil.which(tool)]
+    try:
+        import ctranslate2
+        if ctranslate2.get_cuda_device_count() == 0:
+            problems.append("No NVIDIA GPU (CUDA) was found. Update the NVIDIA driver or check the GPU is enabled.")
+    except Exception as e:
+        problems.append(f"The transcription engine could not be loaded: {e}")
+    return problems
+
+
+def is_gpu_error(e: Exception) -> bool:
+    """A GPU failure (out of memory, driver crash) would fail every remaining video too."""
+    return any(k in str(e) for k in ("CUDA", "cuBLAS", "cuDNN", "out of memory"))
+
+
 def keep_awake(on: bool):
     """Stop Windows from sleeping while this thread runs a batch (the screen may still turn off)."""
     if os.name == "nt":
@@ -165,11 +184,12 @@ def keep_awake(on: bool):
 
 
 def run_batch(todo, durations, log_path, model_name="large-v3-turbo", compute_type="int8_float16",
-              on_event=lambda kind, **info: None, should_stop=lambda: False):
+              on_event=lambda kind, **info: None, should_stop=lambda: False, skip_existing=True):
     """Transcribe each video in `todo`, reporting through on_event(kind, **info).
 
-    Events: loading, start, progress, done, failed, finished. A stop request abandons
-    the current file (no .srt is written for it). Returns the number of failures.
+    Events: loading, start, progress, done, skipped, failed, finished. A stop request abandons
+    the current file (no .srt is written for it); a GPU error stops the batch.
+    Returns the number of failures.
     """
     durations = dict(durations)  # corrected below with each file's decoded length
     total_audio = sum(durations.values())
@@ -182,12 +202,17 @@ def run_batch(todo, durations, log_path, model_name="large-v3-turbo", compute_ty
         on_event("loading", model=model_name)
         model = WhisperModel(model_name, device="cuda", compute_type=compute_type)
 
-        done_audio, ok, failures, stopped = 0.0, 0, 0, False
+        done_audio, ok, failures, stopped, gpu_error = 0.0, 0, 0, False, None
         t0 = time.time()
         for n, vid in enumerate(todo, 1):
             if should_stop():
                 stopped = True
                 break
+            if skip_existing and vid.with_suffix(".srt").exists():  # e.g. made by another window meanwhile
+                log_history(f"  SKIPPED  {vid}  (already has .srt)")
+                on_event("skipped", n=n, video=vid)
+                done_audio += durations[vid]
+                continue
             dur = durations[vid]
             on_event("start", n=n, total=len(todo), video=vid, duration=dur)
             t_file = time.time()
@@ -230,11 +255,14 @@ def run_batch(todo, durations, log_path, model_name="large-v3-turbo", compute_ty
                 log_history(f"  FAILED   {vid}  ({e}; details in {log_path})")
                 with open(log_path, "a", encoding="utf-8") as log:
                     log.write(f"[{dt.datetime.now():%Y-%m-%d %H:%M}] {vid}\n{traceback.format_exc()}\n")
+                if is_gpu_error(e):
+                    stopped, gpu_error = True, str(e)
+                    break
             done_audio += durations[vid]
 
         log_history(f"BATCH {'STOPPED' if stopped else 'END'}  {ok} ok, {failures} failed, "
-                    f"took {fmt_dur(time.time() - t0)}")
-        on_event("finished", ok=ok, failed=failures, stopped=stopped,
+                    f"took {fmt_dur(time.time() - t0)}" + (f"  (GPU error: {gpu_error})" if gpu_error else ""))
+        on_event("finished", ok=ok, failed=failures, stopped=stopped, gpu_error=gpu_error,
                  elapsed=time.time() - t0, log_path=log_path)
         return failures
     except BaseException as e:  # model failed to load, Ctrl+C, ...
@@ -254,9 +282,14 @@ def print_event(kind, **e):
               f"  | {e['speed']:4.1f}x realtime | ETA {fmt_dur(e['eta'])}   ", end="", flush=True)
     elif kind == "done":
         print(f"\r   done -> {e['srt'].name}" + " " * 40)
+    elif kind == "skipped":
+        print("   skipped (an .srt appeared meanwhile)")
     elif kind == "failed":
         print(f"\n   FAILED: {e['error']}")
     elif kind == "finished":
+        if e["gpu_error"]:
+            print("\nStopped: the GPU failed, so the remaining videos were not attempted.\n"
+                  "Close other GPU-heavy apps (or restart the PC), then run again to continue.")
         print(f"\nFinished in {fmt_dur(e['elapsed'])}. {e['ok']} ok, {e['failed']} failed.")
         if e["failed"]:
             print(f"See {e['log_path']}")
@@ -276,6 +309,11 @@ def main():
     ap.add_argument("--force", action="store_true", help="redo videos that already have .srt")
     args = ap.parse_args()
 
+    problems = check_prerequisites()
+    if problems:
+        print("Cannot start:\n" + "\n".join(f"  - {p}" for p in problems))
+        return 1
+
     videos = collect(args.inputs)
     todo = [v for v in videos if args.force or not v.with_suffix(".srt").exists()]
     print(f"Found {len(videos)} videos, {len(videos) - len(todo)} already captioned, {len(todo)} to do.")
@@ -287,7 +325,7 @@ def main():
 
     try:
         failures = run_batch(todo, durations, error_log_path(args.inputs[0]), args.model, args.compute_type,
-                             on_event=print_event)
+                             on_event=print_event, skip_existing=not args.force)
     except KeyboardInterrupt:
         print("\nStopped. Rerun to continue where you left off.")
         return 130

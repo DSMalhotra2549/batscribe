@@ -84,6 +84,8 @@ class App:
         ttk.Button(buttons, text="Logs", command=self.show_logs).pack(side="right", padx=(0, 8))
 
         root.after(100, self.pump)
+        threading.Thread(target=lambda: self.events.put(("checked", {"problems": bs.check_prerequisites()})),
+                         daemon=True).start()
         if initial_inputs:
             self.load(initial_inputs)
 
@@ -177,6 +179,11 @@ class App:
     def set_status(self, video, text, tag=()):
         self.tree.item(self.rows[video], values=(text,), tags=tag)
 
+    def on_checked(self, problems):
+        if problems:
+            self.notify("Batscribe – setup problem", "Captioning won't work until this is fixed:\n\n"
+                        + "\n\n".join(f"• {p}" for p in problems), error=True)
+
     def on_loading(self, model):
         self.stats.config(text=f"Loading model {model} on the GPU…")
 
@@ -198,10 +205,13 @@ class App:
     def on_done(self, n, video, srt):
         self.set_status(video, "✔ done", ("done",))
 
+    def on_skipped(self, n, video):
+        self.set_status(video, "✔ already done", ("done",))
+
     def on_failed(self, n, video, error):
         self.set_status(video, "✖ failed", ("failed",))
 
-    def on_finished(self, ok, failed, stopped, elapsed, log_path):
+    def on_finished(self, ok, failed, stopped, gpu_error, elapsed, log_path):
         for v in self.todo:  # the video that was interrupted, if any
             if self.tree.set(self.rows[v], "status").startswith("▶"):
                 self.set_status(v, "stopped")
@@ -213,7 +223,10 @@ class App:
         self.stats.config(text=msg)
         if failed:
             msg += f"\n\nDetails of failures:\n{log_path}"
-        if self.todo and not stopped:
+        if gpu_error:
+            msg += ("\n\nThe GPU failed, so the remaining videos were not attempted:\n"
+                    f"{gpu_error}\n\nClose other GPU-heavy apps (or restart the PC), then press Start to continue.")
+        elif self.todo and not stopped:
             msg += "\n\nPress Start to retry the failed videos."
         self.notify("Batscribe", msg, error=bool(failed))
 
