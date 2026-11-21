@@ -147,6 +147,15 @@ def error_log_path(first_input) -> Path:
     return (root if root.is_dir() else root.parent) / "batscribe_errors.log"
 
 
+HISTORY_LOG = Path(__file__).with_name("batscribe_history.log")
+
+
+def log_history(line: str):
+    """Append a timestamped line to the history log shared by the CLI and the GUI."""
+    with open(HISTORY_LOG, "a", encoding="utf-8") as f:
+        f.write(f"{dt.datetime.now():%Y-%m-%d %H:%M:%S}  {line}\n")
+
+
 def keep_awake(on: bool):
     """Stop Windows from sleeping while this thread runs a batch (the screen may still turn off)."""
     if os.name == "nt":
@@ -165,6 +174,8 @@ def run_batch(todo, durations, log_path, model_name="large-v3-turbo", compute_ty
     durations = dict(durations)  # corrected below with each file's decoded length
     total_audio = sum(durations.values())
     keep_awake(True)
+    log_history(f"BATCH START  {len(todo)} videos, {fmt_dur(total_audio)} of audio, "
+                f"model {model_name}, in {log_path.parent}")
     try:
         add_cuda_dll_dirs()
         from faster_whisper import WhisperModel
@@ -179,6 +190,7 @@ def run_batch(todo, durations, log_path, model_name="large-v3-turbo", compute_ty
                 break
             dur = durations[vid]
             on_event("start", n=n, total=len(todo), video=vid, duration=dur)
+            t_file = time.time()
             try:
                 audio = load_audio(vid)
                 segments, info = model.transcribe(
@@ -203,21 +215,31 @@ def run_batch(todo, durations, log_path, model_name="large-v3-turbo", compute_ty
                              speed=speed,
                              eta=max(0, total_audio - processed) / speed if speed > 0 else 0)
                 if stopped:
+                    log_history(f"  STOPPED  {vid}  (not saved)")
                     break
                 srt = vid.with_suffix(".srt")
                 write_srt(build_cues(words), srt)
                 ok += 1
+                took = time.time() - t_file
+                log_history(f"  OK       {vid}  ({fmt_dur(dur)} of audio in {fmt_dur(took)}, "
+                            f"{dur / max(took, 0.001):.1f}x realtime)")
                 on_event("done", n=n, video=vid, srt=srt)
             except Exception as e:
                 failures += 1
                 on_event("failed", n=n, video=vid, error=str(e))
+                log_history(f"  FAILED   {vid}  ({e}; details in {log_path})")
                 with open(log_path, "a", encoding="utf-8") as log:
                     log.write(f"[{dt.datetime.now():%Y-%m-%d %H:%M}] {vid}\n{traceback.format_exc()}\n")
             done_audio += durations[vid]
 
+        log_history(f"BATCH {'STOPPED' if stopped else 'END'}  {ok} ok, {failures} failed, "
+                    f"took {fmt_dur(time.time() - t0)}")
         on_event("finished", ok=ok, failed=failures, stopped=stopped,
                  elapsed=time.time() - t0, log_path=log_path)
         return failures
+    except BaseException as e:  # model failed to load, Ctrl+C, ...
+        log_history(f"BATCH ABORTED  {e!r}")
+        raise
     finally:
         keep_awake(False)
 

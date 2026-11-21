@@ -17,6 +17,8 @@ from tkinterdnd2 import DND_FILES, TkinterDnD
 
 import batscribe as bs
 
+NOTHING_SELECTED = "Nothing selected yet."
+
 
 class App:
     def __init__(self, root, initial_inputs):
@@ -40,16 +42,20 @@ class App:
         drop.pack(fill="x", **pad)
         tk.Label(drop, text="Drop a folder or videos here", bg="#eef3fb", fg="#2b4a75",
                  font=("Segoe UI", 13)).pack(pady=(14, 4))
-        self.browse_btn = ttk.Button(drop, text="Browse for folder…", command=self.browse)
-        self.browse_btn.pack(pady=(0, 14))
+        pick = tk.Frame(drop, bg="#eef3fb")
+        pick.pack(pady=(0, 14))
+        self.browse_btn = ttk.Button(pick, text="Choose folder…", command=self.browse)
+        self.browse_btn.pack(side="left", padx=4)
+        self.files_btn = ttk.Button(pick, text="Choose videos…", command=self.browse_files)
+        self.files_btn.pack(side="left", padx=4)
 
-        self.summary = ttk.Label(root, text="No folder selected.")
+        self.summary = ttk.Label(root, text=NOTHING_SELECTED)
         self.summary.pack(fill="x", **pad)
 
         list_frame = ttk.Frame(root)
         list_frame.pack(fill="both", expand=True, **pad)
         self.tree = ttk.Treeview(list_frame, columns=("status",), selectmode="browse")
-        self.tree.heading("#0", text="Video", anchor="w")
+        self.tree.heading("#0", text="Video  (double-click to play)", anchor="w")
         self.tree.heading("status", text="Status", anchor="w")
         self.tree.column("status", width=130, stretch=False)
         self.tree.tag_configure("done", foreground="#1e7b34")
@@ -72,8 +78,10 @@ class App:
         self.start_btn.pack(side="left")
         self.stop_btn = ttk.Button(buttons, text="Stop", command=self.stop, state="disabled")
         self.stop_btn.pack(side="left", padx=(8, 0))
-        ttk.Label(buttons, text="Double-click a video to play it", foreground="#777").pack(side="left", padx=12)
+        self.new_btn = ttk.Button(buttons, text="New batch", command=self.new_batch)
+        self.new_btn.pack(side="left", padx=(8, 0))
         ttk.Button(buttons, text="Show in folder", command=self.show_in_folder).pack(side="right")
+        ttk.Button(buttons, text="Logs", command=self.show_logs).pack(side="right", padx=(0, 8))
 
         root.after(100, self.pump)
         if initial_inputs:
@@ -88,6 +96,22 @@ class App:
         folder = filedialog.askdirectory(title="Choose a folder of videos")
         if folder:
             self.load([folder])
+
+    def browse_files(self):
+        exts = " ".join("*" + e for e in sorted(bs.VIDEO_EXTS))
+        files = filedialog.askopenfilenames(title="Choose videos", filetypes=[("Videos", exts), ("All files", "*.*")])
+        if files:
+            self.load(list(files))
+
+    def new_batch(self):
+        """Clear the window so another folder or set of videos can be chosen."""
+        self.inputs, self.todo, self.durations = [], [], {}
+        self.tree.delete(*self.tree.get_children())
+        self.rows.clear()
+        self.summary.config(text=NOTHING_SELECTED)
+        self.progress["value"] = 0
+        self.stats.config(text="")
+        self.set_busy(False)
 
     def load(self, inputs):
         """Scan in the background (ffprobe on many files takes a few seconds)."""
@@ -209,7 +233,8 @@ class App:
 
     def set_busy(self, busy):
         self.busy = busy
-        self.browse_btn.config(state="disabled" if busy else "normal")
+        for btn in (self.browse_btn, self.files_btn, self.new_btn):
+            btn.config(state="disabled" if busy else "normal")
         self.start_btn.config(state="disabled" if busy or not self.todo else "normal")
         if not busy:
             self.stop_btn.config(state="disabled")
@@ -228,6 +253,12 @@ class App:
         target = video if video else (Path(self.inputs[0]) if self.inputs else None)
         if target:
             subprocess.Popen(f'explorer /select,"{target}"')
+
+    def show_logs(self):
+        if bs.HISTORY_LOG.exists():
+            os.startfile(bs.HISTORY_LOG)  # opens in Notepad (or the default .log viewer)
+        else:
+            messagebox.showinfo("Batscribe", "Nothing has been converted yet.", parent=self.root)
 
     def on_close(self):
         if self.running:
