@@ -18,6 +18,8 @@ MAX_LINE = 42          # chars per subtitle line
 MAX_LINES = 2
 MAX_CUE_SECONDS = 6.0
 MIN_CUE_CHARS_AT_SENTENCE_END = 20
+# Don't open a console window per ffmpeg/ffprobe call when run from the windowless GUI.
+NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
 
 def add_cuda_dll_dirs():
@@ -106,7 +108,7 @@ def video_duration(path: Path) -> float:
     try:
         out = subprocess.run(
             ["ffprobe", "-v", "error", "-protocol_whitelist", "file", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True, timeout=60, creationflags=NO_WINDOW,
         ).stdout.strip()
         return float(out)
     except Exception:
@@ -119,7 +121,7 @@ def load_audio(path: Path):
     proc = subprocess.run(
         ["ffmpeg", "-nostdin", "-v", "error", "-protocol_whitelist", "file", "-i", str(path), "-vn", "-ac", "1", "-ar", "16000",
          "-f", "f32le", "-"],
-        capture_output=True,
+        capture_output=True, creationflags=NO_WINDOW,
     )
     if proc.returncode != 0 or not proc.stdout:
         msg = proc.stderr.decode("utf-8", "replace").strip().splitlines()
@@ -160,6 +162,7 @@ def run_batch(todo, durations, log_path, model_name="large-v3-turbo", compute_ty
     Events: loading, start, progress, done, failed, finished. A stop request abandons
     the current file (no .srt is written for it). Returns the number of failures.
     """
+    durations = dict(durations)  # corrected below with each file's decoded length
     total_audio = sum(durations.values())
     keep_awake(True)
     try:
@@ -183,6 +186,8 @@ def run_batch(todo, durations, log_path, model_name="large-v3-turbo", compute_ty
                     condition_on_previous_text=False, beam_size=5,
                 )
                 dur = info.duration or dur
+                total_audio += dur - durations[vid]  # the scan's ffprobe value may be off (0 if it failed)
+                durations[vid] = dur
                 words = []
                 for seg in segments:
                     if should_stop():
@@ -193,10 +198,10 @@ def run_batch(todo, durations, log_path, model_name="large-v3-turbo", compute_ty
                     processed = done_audio + seg.end
                     speed = processed / elapsed if elapsed > 0 else 0
                     on_event("progress", n=n, video=vid,
-                             file_pct=100 * seg.end / dur if dur else 0,
-                             overall_pct=100 * processed / max(total_audio, 1),
+                             file_pct=min(100, 100 * seg.end / dur) if dur else 0,
+                             overall_pct=min(100, 100 * processed / max(total_audio, 1)),
                              speed=speed,
-                             eta=(total_audio - processed) / speed if speed > 0 else 0)
+                             eta=max(0, total_audio - processed) / speed if speed > 0 else 0)
                 if stopped:
                     break
                 srt = vid.with_suffix(".srt")
