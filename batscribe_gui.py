@@ -18,6 +18,7 @@ from tkinterdnd2 import DND_FILES, TkinterDnD
 import batscribe as bs
 
 NOTHING_SELECTED = "Nothing selected yet."
+APP_ID = "Batscribe.Captions"  # must match create_shortcut.ps1
 
 
 class App:
@@ -285,7 +286,10 @@ class App:
 
 def main():
     ctypes.windll.shcore.SetProcessDpiAwareness(1)  # crisp text on high-DPI screens
+    # Identify as Batscribe, not "Python", so a taskbar pin relaunches this app (see create_shortcut.ps1).
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
     root = TkinterDnD.Tk()
+    root.iconphoto(True, tk.PhotoImage(file=Path(__file__).with_name("batscribe.png")))
     App(root, sys.argv[1:])
     root.mainloop()
 
