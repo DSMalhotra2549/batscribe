@@ -18,6 +18,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
+AUDIO_EXTS = {".mp3", ".m4a", ".wav", ".aac", ".ogg", ".opus", ".flac"}  # podcasts, voice memos, calls
+MEDIA_EXTS = VIDEO_EXTS | AUDIO_EXTS  # what counts as a Video: only the audio is used anyway
 CAPTION_EXTS = {".srt", ".vtt", ".ass", ".ssa", ".sub"}
 SR = 16000             # audio sample rate the model expects
 # faster-whisper needs ~60 MB of RAM per minute of audio it is given at once, so long videos
@@ -190,8 +192,8 @@ def collect(inputs):
     for raw in inputs:
         p = Path(raw.strip().strip('"'))
         if p.is_dir():
-            vids += [v for v in p.rglob("*") if v.is_file() and v.suffix.lower() in VIDEO_EXTS]
-        elif p.is_file() and p.suffix.lower() in VIDEO_EXTS:
+            vids += [v for v in p.rglob("*") if v.is_file() and v.suffix.lower() in MEDIA_EXTS]
+        elif p.is_file() and p.suffix.lower() in MEDIA_EXTS:
             vids.append(p)
         else:
             print(f"!! Not a folder or video: {p}")

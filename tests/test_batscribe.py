@@ -261,6 +261,13 @@ class RunBatchTests(unittest.TestCase):
         self.assertIn("3 videos", lost[0])
         self.assertEqual(bs.unfinished_batches(), [])
 
+    def test_collect_includes_audio_files_but_not_other_files(self):
+        (vid,) = self.videos(a=1)
+        for name in ("talk.mp3", "memo.M4A", "notes.txt", "a.srt"):
+            (self.dir / name).write_text("1")
+        self.assertEqual([p.name for p in bs.collect([str(self.dir)])], ["a.mp4", "memo.M4A", "talk.mp3"])
+        self.assertEqual(bs.collect([str(self.dir / "talk.mp3")]), [self.dir / "talk.mp3"])
+
     def test_name_clashes_and_other_captions(self):
         a_mp4, a_mkv, b = self.videos(a=1, b=1)[0], self.dir / "a.mkv", self.dir / "b.mp4"
         a_mkv.write_text("1")

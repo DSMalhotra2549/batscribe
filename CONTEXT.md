@@ -11,7 +11,7 @@ A folder or a single video the user hands to Batscribe (dropped, chosen, or pass
 _Avoid_: Source, target, path
 
 **Video**:
-A media file with a recognised video extension found in an Input. Only its audio matters.
+A media file with a recognised video or audio extension (`MEDIA_EXTS`) found in an Input. Only its audio matters, so an `.mp3` or `.m4a` is a Video too.
 _Avoid_: Clip, file, lecture
 
 **Name clash**:

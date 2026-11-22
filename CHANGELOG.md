@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Audio files (`.mp3 .m4a .wav .aac .ogg .opus .flac`) are captioned too, from folders, drag and drop, and the file picker.
+
 ## 0.1.0 – 2026-11-22
 
 First public release.
