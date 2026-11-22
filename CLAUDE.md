@@ -1,5 +1,9 @@
 # CLAUDE.md
 
+## Project docs
+
+Before changing code, read `CONTEXT.md` (project vocabulary: use these terms), `docs/ARCHITECTURE.md` (code map, event protocol, invariants, how to test) and `docs/adr/` (why things are the way they are). Run tests with `.venv\Scripts\python.exe -m unittest discover tests`.
+
 Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
 
 **Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.

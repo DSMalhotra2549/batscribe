@@ -1,0 +1,3 @@
+# Detect Crashed batches from PIDs in the History log
+
+A Batch can die without running any cleanup (native crash inside the GPU engine, power loss, console window closed). Every `BATCH` line in the History log ends with `[pid N]`; at the next launch, a `START` with no later line for the same PID whose process is no longer alive is reported once and then marked `BATCH CRASHED`, so it isn't reported again. This avoids a lock or state file that a crash would leave stale, and keeps the History log as the single record of what happened. The liveness check is Windows-only; elsewhere processes are assumed alive so nothing is misreported.
