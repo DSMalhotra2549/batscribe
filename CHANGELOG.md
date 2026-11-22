@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Command line: `--format md` writes a Markdown transcript (`<video> transcript.md`: header, then `[h:mm:ss]` paragraphs split at pauses over 2 s) instead of an `.srt`. The default stays `srt`; the desktop app is unchanged.
+- Audio files (`.mp3 .m4a .wav .aac .ogg .opus .flac`) are captioned too, from folders, drag and drop, and the file picker.
 
 ## 0.1.0 – 2026-11-22
 

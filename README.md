@@ -24,7 +24,7 @@ Course/
 
 ## Features
 
-- **Batch everything**: folders are searched recursively; `.mp4 .mkv .mov .avi .webm .m4v` supported.
+- **Batch everything**: folders are searched recursively; `.mp4 .mkv .mov .avi .webm .m4v` supported, plus audio files (`.mp3 .m4a .wav .aac .ogg .opus .flac`).
 - **Resumable**: videos that already have an `.srt` are skipped, so you can stop at any time and pick up later.
 - **Two ways to use it**: a desktop window with drag and drop, or a command line / drag-onto-`captions.bat`.
 - **99 languages**: the spoken language is detected per video, or you can choose it.

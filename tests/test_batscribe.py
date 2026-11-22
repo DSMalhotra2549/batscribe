@@ -300,6 +300,13 @@ class RunBatchTests(unittest.TestCase):
         self.assertTrue((self.dir / "b transcript.md").exists())
         self.assertEqual(vids[1].with_suffix(".srt").read_text(encoding="utf-8"), "subtitles")
 
+    def test_collect_includes_audio_files_but_not_other_files(self):
+        (vid,) = self.videos(a=1)
+        for name in ("talk.mp3", "memo.M4A", "notes.txt", "a.srt"):
+            (self.dir / name).write_text("1")
+        self.assertEqual([p.name for p in bs.collect([str(self.dir)])], ["a.mp4", "memo.M4A", "talk.mp3"])
+        self.assertEqual(bs.collect([str(self.dir / "talk.mp3")]), [self.dir / "talk.mp3"])
+
     def test_name_clashes_and_other_captions(self):
         a_mp4, a_mkv, b = self.videos(a=1, b=1)[0], self.dir / "a.mkv", self.dir / "b.mp4"
         a_mkv.write_text("1")

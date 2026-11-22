@@ -144,8 +144,8 @@ class App:
             self.load([folder])
 
     def browse_files(self):
-        exts = " ".join("*" + e for e in sorted(bs.VIDEO_EXTS))
-        files = filedialog.askopenfilenames(title="Choose videos", filetypes=[("Videos", exts), ("All files", "*.*")])
+        exts = " ".join("*" + e for e in sorted(bs.MEDIA_EXTS))
+        files = filedialog.askopenfilenames(title="Choose videos", filetypes=[("Videos and audio", exts), ("All files", "*.*")])
         if files:
             self.load(list(files))
 
