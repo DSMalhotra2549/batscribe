@@ -281,8 +281,10 @@ def keep_awake(on: bool):
 
 
 def run_batch(todo, durations, log_path, model_name="large-v3-turbo", compute_type="int8_float16",
-              on_event=lambda kind, **info: None, should_stop=lambda: False, skip_existing=True):
+              on_event=lambda kind, **info: None, should_stop=lambda: False, skip_existing=True, fast=False):
     """Transcribe each video in `todo`, reporting through on_event(kind, **info).
+
+    fast=True uses faster-whisper's batched mode: about 2.5x faster, slightly less accurate.
 
     Events: loading, start, progress, done, skipped, failed, finished. A stop request abandons
     the current file (no .srt is written for it); a GPU error stops the batch.
@@ -292,12 +294,22 @@ def run_batch(todo, durations, log_path, model_name="large-v3-turbo", compute_ty
     total_audio = sum(durations.values())
     keep_awake(True)
     log_batch(f"START  {len(todo)} videos, {fmt_dur(total_audio)} of audio, "
-              f"model {model_name}, in {log_path.parent}")
+              f"model {model_name}{', fast mode' if fast else ''}, in {log_path.parent}")
     try:
         add_cuda_dll_dirs()
         from faster_whisper import WhisperModel
         on_event("loading", model=model_name)
         model = WhisperModel(model_name, device="cuda", compute_type=compute_type)
+        if fast:
+            from faster_whisper import BatchedInferencePipeline
+            batched = BatchedInferencePipeline(model=model)
+
+            def transcribe(audio):
+                return batched.transcribe(audio, language="en", word_timestamps=True, batch_size=8, beam_size=5)
+        else:
+            def transcribe(audio):
+                return model.transcribe(audio, language="en", vad_filter=True, word_timestamps=True,
+                                        condition_on_previous_text=False, beam_size=5)
 
         done_audio, ok, failures, stopped, gpu_error = 0.0, 0, 0, False, None
         t0 = time.time()
@@ -322,10 +334,7 @@ def run_batch(todo, durations, log_path, model_name="large-v3-turbo", compute_ty
                 words = []
                 for a, b in chunk_bounds(audio):
                     offset = a / SR
-                    segments, _ = model.transcribe(
-                        audio[a:b], language="en", vad_filter=True, word_timestamps=True,
-                        condition_on_previous_text=False, beam_size=5,
-                    )
+                    segments, _ = transcribe(audio[a:b])
                     for seg in segments:
                         if should_stop():
                             stopped = True
@@ -414,6 +423,7 @@ def main():
     ap.add_argument("--model", default="large-v3-turbo")
     ap.add_argument("--compute-type", default="int8_float16")
     ap.add_argument("--force", action="store_true", help="redo videos that already have .srt")
+    ap.add_argument("--fast", action="store_true", help="batched mode: about 2.5x faster, slightly less accurate")
     args = ap.parse_args()
 
     problems = check_prerequisites()
@@ -438,7 +448,7 @@ def main():
 
     try:
         failures = run_batch(todo, durations, error_log_path(args.inputs[0]), args.model, args.compute_type,
-                             on_event=print_event, skip_existing=not args.force)
+                             on_event=print_event, skip_existing=not args.force, fast=args.fast)
     except KeyboardInterrupt:
         print("\nStopped. Rerun to continue where you left off.")
         return 130

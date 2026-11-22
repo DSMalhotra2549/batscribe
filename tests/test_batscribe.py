@@ -43,6 +43,18 @@ class FakeModel:
         return segments(), NS(duration=dur)
 
 
+class FakeBatched:
+    """Stands in for faster_whisper.BatchedInferencePipeline."""
+    calls = 0
+
+    def __init__(self, model):
+        self.model = model
+
+    def transcribe(self, audio, **kwargs):
+        FakeBatched.calls += 1
+        return self.model.transcribe(audio)
+
+
 class FakeAudio(np.ndarray):
     """Silent audio that remembers which video it came from (so FakeModel can fail on purpose)."""
 
@@ -93,8 +105,9 @@ class RunBatchTests(unittest.TestCase):
         bs.load_audio, bs.HISTORY_LOG = fake_load_audio, self.dir / "history.log"
         bs.add_cuda_dll_dirs = lambda: None
         self.old_fw = sys.modules.get("faster_whisper")
-        sys.modules["faster_whisper"] = types.SimpleNamespace(WhisperModel=FakeModel)
-        FakeModel.fail_on, FakeModel.calls = {}, 0
+        sys.modules["faster_whisper"] = types.SimpleNamespace(WhisperModel=FakeModel,
+                                                              BatchedInferencePipeline=FakeBatched)
+        FakeModel.fail_on, FakeModel.calls, FakeBatched.calls = {}, 0, 0
         self.events = []
 
     def tearDown(self):
@@ -154,6 +167,19 @@ class RunBatchTests(unittest.TestCase):
         vid.with_suffix(".srt").write_text("old", encoding="utf-8")
         self.run_batch([vid], {vid: 10.0}, skip_existing=False)
         self.assertNotEqual(vid.with_suffix(".srt").read_text(encoding="utf-8"), "old")
+
+    def test_fast_mode_uses_batched_pipeline(self):
+        vids = self.videos(a=10, b=5)
+        self.assertEqual(self.run_batch(vids, {v: 10.0 for v in vids}, fast=True), 0)
+        self.assertEqual(FakeBatched.calls, 2)
+        self.assertTrue(all(v.with_suffix(".srt").exists() for v in vids))
+        self.assertIn("fast mode", bs.HISTORY_LOG.read_text(encoding="utf-8"))
+
+    def test_normal_mode_does_not_use_batched_pipeline(self):
+        (vid,) = self.videos(a=10)
+        self.run_batch([vid], {vid: 10.0})
+        self.assertEqual((FakeBatched.calls, FakeModel.calls), (0, 1))
+        self.assertNotIn("fast mode", bs.HISTORY_LOG.read_text(encoding="utf-8"))
 
     def test_ordinary_failure_is_logged_and_batch_continues(self):
         vids = self.videos(a=10, bad=10, c=10)

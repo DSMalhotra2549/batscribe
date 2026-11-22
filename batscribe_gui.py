@@ -38,6 +38,7 @@ class App:
         self.events = queue.Queue()      # worker thread -> UI thread
         self.stop_flag = threading.Event()
         self.inputs, self.todo, self.durations, self.rows = [], [], {}, {}
+        self.finished = set()            # videos captioned in the current/last run
         self.busy = False                # scanning or transcribing
         self.running = False             # transcribing
         self.current = ""
@@ -85,6 +86,17 @@ class App:
         self.progress.pack(fill="x", **pad)
         self.stats = ttk.Label(root, text="")
         self.stats.pack(fill="x", padx=12, pady=(4, 0))
+
+        options = ttk.Frame(root)
+        options.pack(fill="x", padx=12, pady=(10, 0))
+        self.fast = tk.BooleanVar()
+        self.fast_box = ttk.Checkbutton(options, text="Fast mode (about 2.5x faster, slightly less accurate)",
+                                        variable=self.fast)
+        self.fast_box.pack(anchor="w")
+        self.redo = tk.BooleanVar()
+        self.redo_box = ttk.Checkbutton(options, text="Redo videos that already have captions",
+                                        variable=self.redo, command=lambda: self.inputs and self.load(self.inputs))
+        self.redo_box.pack(anchor="w", pady=(2, 0))
 
         buttons = ttk.Frame(root)
         buttons.pack(fill="x", padx=12, pady=12)
@@ -140,12 +152,13 @@ class App:
         self.summary.config(text="Scanning…")
         self.tree.delete(*self.tree.get_children())
         self.rows.clear()
+        redo = self.redo.get()
 
         def scan():
             try:
                 videos = bs.collect(self.inputs)
                 clashes = bs.name_clashes(videos)
-                todo = [v for v in videos if v not in clashes and not v.with_suffix(".srt").exists()]
+                todo = [v for v in videos if v not in clashes and (redo or not v.with_suffix(".srt").exists())]
                 others = {v: names for v in todo if (names := bs.other_captions(v))}
                 durations = {v: bs.video_duration(v) for v in todo}
             except Exception as e:  # e.g. the drive was unplugged or a folder can't be read
@@ -171,6 +184,8 @@ class App:
                 status, tag = "⚠ name clash", ("warn",)
             elif v not in durations:
                 status, tag = "✔ already done", ("done",)
+            elif v.with_suffix(".srt").exists():
+                status, tag = "waiting (redo)", ()
             else:
                 status, tag = ("waiting (has captions)" if v in others else "waiting"), ()
             self.rows[v] = self.tree.insert("", "end", text=label, tags=tag, values=(status,))
@@ -192,6 +207,11 @@ class App:
 
     # ---- running --------------------------------------------------------
     def start(self):
+        if self.redo.get() and (n := sum(v.with_suffix(".srt").exists() for v in self.todo)):
+            if not messagebox.askyesno("Batscribe", f"This replaces the existing .srt of {n} video{'' if n == 1 else 's'}. Continue?",
+                                       parent=self.root):
+                return
+        self.finished = set()
         self.stop_flag.clear()
         self.running = True
         self.set_busy(True)
@@ -202,7 +222,8 @@ class App:
             try:
                 bs.run_batch(self.todo, self.durations, bs.error_log_path(self.inputs[0]),
                              on_event=lambda kind, **info: self.events.put((kind, info)),
-                             should_stop=self.stop_flag.is_set)
+                             should_stop=self.stop_flag.is_set, skip_existing=not self.redo.get(),
+                             fast=self.fast.get())
             except Exception as e:  # e.g. model/GPU failed to load
                 self.events.put(("crashed", {"error": str(e)}))
 
@@ -265,6 +286,7 @@ class App:
                                    f"{speed:.1f}x realtime · about {bs.fmt_dur(eta)} left")
 
     def on_done(self, n, video, srt):
+        self.finished.add(video)
         self.set_status(video, "✔ done", ("done",))
 
     def on_skipped(self, n, video):
@@ -277,7 +299,8 @@ class App:
         for v in self.todo:  # the video that was interrupted, if any
             if self.tree.set(self.rows[v], "status").startswith("▶"):
                 self.set_status(v, "stopped")
-        self.todo = [v for v in self.todo if not v.with_suffix(".srt").exists()]
+        self.todo = [v for v in self.todo
+                     if v not in self.finished and (self.redo.get() or not v.with_suffix(".srt").exists())]
         self.running = False
         self.set_busy(False)
         self.root.title("Batscribe")
@@ -308,7 +331,7 @@ class App:
 
     def set_busy(self, busy):
         self.busy = busy
-        for btn in (self.browse_btn, self.files_btn, self.new_btn):
+        for btn in (self.browse_btn, self.files_btn, self.new_btn, self.fast_box, self.redo_box):
             btn.config(state="disabled" if busy else "normal")
         self.start_btn.config(state="disabled" if busy or not self.todo else "normal")
         if not busy:
