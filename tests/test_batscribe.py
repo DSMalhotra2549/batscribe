@@ -3,6 +3,7 @@
 Run:  .venv\\Scripts\\python.exe -m unittest discover tests
 """
 import re
+import subprocess
 import sys
 import tempfile
 import types
@@ -21,11 +22,13 @@ SR = 16000
 class FakeModel:
     """Stands in for faster_whisper.WhisperModel: one 4-second segment of two words at a time."""
     fail_on = {}  # file stem -> exception message raised when that video is transcribed
+    calls = 0
 
     def __init__(self, *args, **kwargs):
         pass
 
     def transcribe(self, audio, **kwargs):
+        FakeModel.calls += 1
         if audio.name in self.fail_on:
             raise RuntimeError(self.fail_on[audio.name])
         dur = len(audio) / SR
@@ -42,6 +45,9 @@ class FakeModel:
 
 class FakeAudio(np.ndarray):
     """Silent audio that remembers which video it came from (so FakeModel can fail on purpose)."""
+
+    def __array_finalize__(self, obj):  # keep the name on slices (long videos are split into chunks)
+        self.name = getattr(obj, "name", None)
 
 
 def fake_load_audio(path):
@@ -83,12 +89,12 @@ class RunBatchTests(unittest.TestCase):
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp())
         self.patches = {"load_audio": bs.load_audio, "HISTORY_LOG": bs.HISTORY_LOG,
-                        "add_cuda_dll_dirs": bs.add_cuda_dll_dirs}
+                        "add_cuda_dll_dirs": bs.add_cuda_dll_dirs, "CHUNK_SECONDS": bs.CHUNK_SECONDS}
         bs.load_audio, bs.HISTORY_LOG = fake_load_audio, self.dir / "history.log"
         bs.add_cuda_dll_dirs = lambda: None
         self.old_fw = sys.modules.get("faster_whisper")
         sys.modules["faster_whisper"] = types.SimpleNamespace(WhisperModel=FakeModel)
-        FakeModel.fail_on = {}
+        FakeModel.fail_on, FakeModel.calls = {}, 0
         self.events = []
 
     def tearDown(self):
@@ -99,7 +105,7 @@ class RunBatchTests(unittest.TestCase):
         else:
             sys.modules["faster_whisper"] = self.old_fw
         for f in sorted(self.dir.rglob("*"), reverse=True):
-            f.unlink()
+            f.rmdir() if f.is_dir() else f.unlink()
         self.dir.rmdir()
 
     def videos(self, **seconds):
@@ -174,6 +180,63 @@ class RunBatchTests(unittest.TestCase):
                        should_stop=lambda: len(self.of_kind("progress")) >= 2)
         self.assertFalse(any(v.with_suffix(".srt").exists() for v in vids))
         self.assertTrue(self.of_kind("finished")[0]["stopped"])
+
+    def test_long_video_is_transcribed_in_chunks_with_continuous_timestamps(self):
+        bs.CHUNK_SECONDS = 20
+        (vid,) = self.videos(long=50)
+        self.run_batch([vid], {vid: 50.0})
+        self.assertEqual(FakeModel.calls, 3)
+        starts = [line.split(" --> ")[0] for line in vid.with_suffix(".srt").read_text(encoding="utf-8").splitlines()
+                  if " --> " in line]
+        self.assertEqual(starts, sorted(starts))
+        self.assertGreater(starts[-1], "00:00:45")  # the last chunk's cues are offset, not restarted at 0
+        self.assertGreater(self.of_kind("progress")[-1]["file_pct"], 99)
+
+    def test_unwritable_error_log_does_not_abort_the_batch(self):
+        vids = self.videos(bad=10, c=10)
+        FakeModel.fail_on = {"bad": "Invalid data found when processing input"}
+        (self.dir / "errors.log").mkdir()  # opening it for writing fails
+        self.assertEqual(self.run_batch(vids, {v: 10.0 for v in vids}), 1)
+        self.assertTrue(vids[1].with_suffix(".srt").exists())
+
+    def test_unfinished_batch_is_reported_once(self):
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        bs.HISTORY_LOG.write_text(
+            f"2026-01-01 10:00:00  BATCH START  3 videos  [pid {dead.pid}]\n"
+            "2026-01-01 10:05:00  BATCH START  1 videos  [pid 1]\n"  # finished below
+            "2026-01-01 10:06:00  BATCH END  1 ok, 0 failed  [pid 1]\n", encoding="utf-8")
+        bs.log_batch("START  running right now")  # this process is alive, so not reported
+        lost = bs.unfinished_batches()
+        self.assertEqual(len(lost), 1)
+        self.assertIn("3 videos", lost[0])
+        self.assertEqual(bs.unfinished_batches(), [])
+
+    def test_name_clashes_and_other_captions(self):
+        a_mp4, a_mkv, b = self.videos(a=1, b=1)[0], self.dir / "a.mkv", self.dir / "b.mp4"
+        a_mkv.write_text("1")
+        for name in ("a.en.srt", "a.vtt", "a.srt", "ab.srt", "b.srt"):
+            (self.dir / name).write_text("x")
+        self.assertEqual(bs.name_clashes(bs.collect([str(self.dir)])), {a_mp4: a_mkv})
+        self.assertEqual(bs.other_captions(a_mp4), ["a.en.srt", "a.vtt"])
+        self.assertEqual(bs.other_captions(b), [])
+
+
+class ChunkTests(unittest.TestCase):
+    def test_cuts_at_quiet_moment_and_covers_everything(self):
+        original = bs.CHUNK_SECONDS
+        bs.CHUNK_SECONDS = 20
+        try:
+            audio = np.random.default_rng(0).uniform(-0.5, 0.5, 45 * SR).astype(np.float32)
+            audio[int(16.0 * SR):int(16.3 * SR)] = 0  # a pause shortly before the 20 s limit
+            bounds = bs.chunk_bounds(audio)
+        finally:
+            bs.CHUNK_SECONDS = original
+        self.assertEqual(bounds[0][0], 0)
+        self.assertEqual(bounds[-1][1], len(audio))
+        self.assertTrue(all(b1 == a2 for (_, b1), (a2, _) in zip(bounds, bounds[1:])))
+        self.assertTrue(16.0 <= bounds[0][1] / SR <= 16.3)
+        self.assertTrue(all(b - a <= 20 * SR for a, b in bounds))
 
 
 class PrerequisiteTests(unittest.TestCase):

@@ -3,3 +3,4 @@ __pycache__/
 test/
 *.lnk
 batscribe_history.log
+batscribe_crash.log

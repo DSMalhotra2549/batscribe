@@ -6,15 +6,23 @@ Writes <video>.srt next to each video. Existing .srt files are skipped (resumabl
 import argparse
 import datetime as dt
 import os
+import re
 import shutil
 import site
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 from pathlib import Path
+from types import SimpleNamespace
 
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
+CAPTION_EXTS = {".srt", ".vtt", ".ass", ".ssa", ".sub"}
+SR = 16000             # audio sample rate the model expects
+# faster-whisper needs ~60 MB of RAM per minute of audio it is given at once, so long videos
+# are transcribed in pieces of at most this length, cut at a quiet moment.
+CHUNK_SECONDS = 600
 MAX_LINE = 42          # chars per subtitle line
 MAX_LINES = 2
 MAX_CUE_SECONDS = 6.0
@@ -117,17 +125,43 @@ def video_duration(path: Path) -> float:
 
 
 def load_audio(path: Path):
-    """Decode to 16 kHz mono float32 with ffmpeg (avoids PyAV version breakage)."""
+    """Decode to 16 kHz mono float32 with ffmpeg (avoids PyAV version breakage).
+
+    ffmpeg writes to a temp file rather than a pipe so the audio is held in memory once, not twice.
+    """
     import numpy as np
-    proc = subprocess.run(
-        ["ffmpeg", "-nostdin", "-v", "error", "-protocol_whitelist", "file", "-i", str(path), "-vn", "-ac", "1", "-ar", "16000",
-         "-f", "f32le", "-"],
-        capture_output=True, creationflags=NO_WINDOW,
-    )
-    if proc.returncode != 0 or not proc.stdout:
+    fd, tmp = tempfile.mkstemp(suffix=".f32", prefix="batscribe_")
+    os.close(fd)
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-nostdin", "-y", "-v", "error", "-protocol_whitelist", "file", "-i", str(path), "-vn", "-ac", "1",
+             "-ar", str(SR), "-f", "f32le", tmp],
+            capture_output=True, creationflags=NO_WINDOW,
+        )
+        audio = np.fromfile(tmp, dtype=np.float32) if proc.returncode == 0 else None
+    finally:
+        os.remove(tmp)
+    if audio is None or not audio.size:
         msg = proc.stderr.decode("utf-8", "replace").strip().splitlines()
         raise RuntimeError("ffmpeg could not decode audio: " + (msg[-1] if msg else "no audio stream"))
-    return np.frombuffer(proc.stdout, dtype=np.float32)
+    return audio
+
+
+def chunk_bounds(audio):
+    """Split audio into pieces of at most CHUNK_SECONDS, each cut at the quietest 0.1 s of the
+    last 30 s before the limit (so a cut doesn't land mid-word). Returns [(start, end)] in samples."""
+    size, frame = CHUNK_SECONDS * SR, SR // 10
+    search = int(min(30, CHUNK_SECONDS / 2) * SR) // frame * frame
+    bounds, start = [], 0
+    while len(audio) - start > size:
+        lo = start + size - search
+        energy = (audio[lo:start + size].reshape(-1, frame) ** 2).mean(axis=1)
+        quietest = len(energy) - 1 - int(energy[::-1].argmin())  # the latest one if tied (digital silence)
+        cut = lo + quietest * frame + frame // 2
+        bounds.append((start, cut))
+        start = cut
+    bounds.append((start, len(audio)))
+    return bounds
 
 
 def collect(inputs):
@@ -143,18 +177,81 @@ def collect(inputs):
     return sorted(set(vids), key=lambda v: str(v).lower())
 
 
+def name_clashes(videos):
+    """Videos that would write the same .srt as an earlier one (e.g. 'a.mp4' and 'a.mkv'): {video: earlier}."""
+    owner, clashes = {}, {}
+    for v in videos:
+        srt = v.with_suffix(".srt")
+        if srt in owner:
+            clashes[v] = owner[srt]
+        else:
+            owner[srt] = v
+    return clashes
+
+
+def other_captions(video):
+    """Caption files next to the video that aren't its <video>.srt, e.g. 'a.en.srt' or 'a.vtt'."""
+    prefix, own = video.stem.lower() + ".", video.with_suffix(".srt")
+    return sorted(f.name for f in video.parent.iterdir()
+                  if f.suffix.lower() in CAPTION_EXTS and f.name.lower().startswith(prefix) and f != own)
+
+
 def error_log_path(first_input) -> Path:
     root = Path(str(first_input).strip('"'))
     return (root if root.is_dir() else root.parent) / "batscribe_errors.log"
 
 
 HISTORY_LOG = Path(__file__).with_name("batscribe_history.log")
+CRASH_LOG = Path(__file__).with_name("batscribe_crash.log")
 
 
 def log_history(line: str):
     """Append a timestamped line to the history log shared by the CLI and the GUI."""
-    with open(HISTORY_LOG, "a", encoding="utf-8") as f:
-        f.write(f"{dt.datetime.now():%Y-%m-%d %H:%M:%S}  {line}\n")
+    try:
+        with open(HISTORY_LOG, "a", encoding="utf-8") as f:
+            f.write(f"{dt.datetime.now():%Y-%m-%d %H:%M:%S}  {line}\n")
+    except OSError:
+        pass  # a log problem (e.g. disk full) must not stop captioning
+
+
+def log_batch(text: str):
+    """BATCH lines carry the process id so a batch that never logged its end can be detected later."""
+    log_history(f"BATCH {text}  [pid {os.getpid()}]")
+
+
+def pid_alive(pid: int) -> bool:
+    if os.name != "nt":
+        return True  # only checked on Windows; assume alive so nothing is misreported
+    import ctypes
+    k32 = ctypes.windll.kernel32
+    k32.OpenProcess.restype = ctypes.c_void_p
+    handle = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return False
+    code = ctypes.c_ulong()
+    k32.GetExitCodeProcess(ctypes.c_void_p(handle), ctypes.byref(code))
+    k32.CloseHandle(ctypes.c_void_p(handle))
+    return code.value == 259  # STILL_ACTIVE
+
+
+def unfinished_batches():
+    """START lines of batches whose process ended without logging an end (hard crash, power loss,
+    console closed). Each is marked CRASHED in the log so it is reported only once."""
+    try:
+        lines = HISTORY_LOG.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    open_batches = {}
+    for line in lines:
+        m = re.search(r"BATCH (\w+) .*\[pid (\d+)\]$", line)
+        if m and m[1] == "START":
+            open_batches[m[2]] = line
+        elif m:
+            open_batches.pop(m[2], None)
+    lost = {pid: line for pid, line in open_batches.items() if not pid_alive(int(pid))}
+    for pid in lost:
+        log_history(f"BATCH CRASHED  ended without finishing (noticed at next launch)  [pid {pid}]")
+    return list(lost.values())
 
 
 def check_prerequisites():
@@ -194,8 +291,8 @@ def run_batch(todo, durations, log_path, model_name="large-v3-turbo", compute_ty
     durations = dict(durations)  # corrected below with each file's decoded length
     total_audio = sum(durations.values())
     keep_awake(True)
-    log_history(f"BATCH START  {len(todo)} videos, {fmt_dur(total_audio)} of audio, "
-                f"model {model_name}, in {log_path.parent}")
+    log_batch(f"START  {len(todo)} videos, {fmt_dur(total_audio)} of audio, "
+              f"model {model_name}, in {log_path.parent}")
     try:
         add_cuda_dll_dirs()
         from faster_whisper import WhisperModel
@@ -216,29 +313,36 @@ def run_batch(todo, durations, log_path, model_name="large-v3-turbo", compute_ty
             dur = durations[vid]
             on_event("start", n=n, total=len(todo), video=vid, duration=dur)
             t_file = time.time()
+            audio = None  # free the previous video's audio before decoding the next
             try:
                 audio = load_audio(vid)
-                segments, info = model.transcribe(
-                    audio, language="en", vad_filter=True, word_timestamps=True,
-                    condition_on_previous_text=False, beam_size=5,
-                )
-                dur = info.duration or dur
+                dur = len(audio) / SR
                 total_audio += dur - durations[vid]  # the scan's ffprobe value may be off (0 if it failed)
                 durations[vid] = dur
                 words = []
-                for seg in segments:
-                    if should_stop():
-                        stopped = True
+                for a, b in chunk_bounds(audio):
+                    offset = a / SR
+                    segments, _ = model.transcribe(
+                        audio[a:b], language="en", vad_filter=True, word_timestamps=True,
+                        condition_on_previous_text=False, beam_size=5,
+                    )
+                    for seg in segments:
+                        if should_stop():
+                            stopped = True
+                            break
+                        words.extend(SimpleNamespace(word=w.word, start=w.start + offset, end=w.end + offset)
+                                     for w in seg.words or [])
+                        pos = offset + seg.end
+                        elapsed = time.time() - t0
+                        processed = done_audio + pos
+                        speed = processed / elapsed if elapsed > 0 else 0
+                        on_event("progress", n=n, video=vid,
+                                 file_pct=min(100, 100 * pos / dur) if dur else 0,
+                                 overall_pct=min(100, 100 * processed / max(total_audio, 1)),
+                                 speed=speed,
+                                 eta=max(0, total_audio - processed) / speed if speed > 0 else 0)
+                    if stopped:
                         break
-                    words.extend(seg.words or [])
-                    elapsed = time.time() - t0
-                    processed = done_audio + seg.end
-                    speed = processed / elapsed if elapsed > 0 else 0
-                    on_event("progress", n=n, video=vid,
-                             file_pct=min(100, 100 * seg.end / dur) if dur else 0,
-                             overall_pct=min(100, 100 * processed / max(total_audio, 1)),
-                             speed=speed,
-                             eta=max(0, total_audio - processed) / speed if speed > 0 else 0)
                 if stopped:
                     log_history(f"  STOPPED  {vid}  (not saved)")
                     break
@@ -253,20 +357,23 @@ def run_batch(todo, durations, log_path, model_name="large-v3-turbo", compute_ty
                 failures += 1
                 on_event("failed", n=n, video=vid, error=str(e))
                 log_history(f"  FAILED   {vid}  ({e}; details in {log_path})")
-                with open(log_path, "a", encoding="utf-8") as log:
-                    log.write(f"[{dt.datetime.now():%Y-%m-%d %H:%M}] {vid}\n{traceback.format_exc()}\n")
+                try:
+                    with open(log_path, "a", encoding="utf-8") as log:
+                        log.write(f"[{dt.datetime.now():%Y-%m-%d %H:%M}] {vid}\n{traceback.format_exc()}\n")
+                except OSError:
+                    pass  # read-only folder or full disk: carry on with the next video
                 if is_gpu_error(e):
                     stopped, gpu_error = True, str(e)
                     break
             done_audio += durations[vid]
 
-        log_history(f"BATCH {'STOPPED' if stopped else 'END'}  {ok} ok, {failures} failed, "
-                    f"took {fmt_dur(time.time() - t0)}" + (f"  (GPU error: {gpu_error})" if gpu_error else ""))
+        log_batch(f"{'STOPPED' if stopped else 'END'}  {ok} ok, {failures} failed, "
+                  f"took {fmt_dur(time.time() - t0)}" + (f"  (GPU error: {gpu_error})" if gpu_error else ""))
         on_event("finished", ok=ok, failed=failures, stopped=stopped, gpu_error=gpu_error,
                  elapsed=time.time() - t0, log_path=log_path)
         return failures
     except BaseException as e:  # model failed to load, Ctrl+C, ...
-        log_history(f"BATCH ABORTED  {e!r}")
+        log_batch(f"ABORTED  {e!r}")
         raise
     finally:
         keep_awake(False)
@@ -314,9 +421,15 @@ def main():
         print("Cannot start:\n" + "\n".join(f"  - {p}" for p in problems))
         return 1
 
+    for line in unfinished_batches():
+        print(f"Note: a previous run ended without finishing (crash, power loss or window closed):\n  {line}")
+
     videos = collect(args.inputs)
-    todo = [v for v in videos if args.force or not v.with_suffix(".srt").exists()]
-    print(f"Found {len(videos)} videos, {len(videos) - len(todo)} already captioned, {len(todo)} to do.")
+    clashes = name_clashes(videos)
+    for v, first in clashes.items():
+        print(f"!! Skipping {v}: same name as {first.name}, so both would use the same .srt. Rename one of them.")
+    todo = [v for v in videos if v not in clashes and (args.force or not v.with_suffix(".srt").exists())]
+    print(f"Found {len(videos)} videos, {len(videos) - len(todo) - len(clashes)} already captioned, {len(todo)} to do.")
     if not todo:
         return 0
 

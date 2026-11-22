@@ -3,12 +3,15 @@
 Launch with .venv\\Scripts\\pythonw.exe batscribe_gui.py [folder-or-video ...]
 """
 import ctypes
+import datetime as dt
+import faulthandler
 import os
 import queue
 import subprocess
 import sys
 import threading
 import tkinter as tk
+import traceback
 import winsound
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -19,6 +22,14 @@ import batscribe as bs
 
 NOTHING_SELECTED = "Nothing selected yet."
 APP_ID = "Batscribe.Captions"  # must match create_shortcut.ps1
+# pythonw has no console, so errors would otherwise vanish. faulthandler also writes here if the
+# process itself crashes (e.g. inside the GPU engine).
+CRASH_FILE = open(bs.CRASH_LOG, "a", encoding="utf-8")
+
+
+def log_crash(text):
+    CRASH_FILE.write(f"--- {dt.datetime.now():%Y-%m-%d %H:%M:%S}\n{text}\n")
+    CRASH_FILE.flush()
 
 
 class App:
@@ -52,16 +63,18 @@ class App:
 
         self.summary = ttk.Label(root, text=NOTHING_SELECTED)
         self.summary.pack(fill="x", **pad)
+        self.summary.bind("<Configure>", lambda e: self.summary.config(wraplength=e.width))
 
         list_frame = ttk.Frame(root)
         list_frame.pack(fill="both", expand=True, **pad)
         self.tree = ttk.Treeview(list_frame, columns=("status",), selectmode="browse")
         self.tree.heading("#0", text="Video  (double-click to play)", anchor="w")
         self.tree.heading("status", text="Status", anchor="w")
-        self.tree.column("status", width=130, stretch=False)
+        self.tree.column("status", width=160, stretch=False)
         self.tree.tag_configure("done", foreground="#1e7b34")
         self.tree.tag_configure("failed", foreground="#b3261e")
         self.tree.tag_configure("active", foreground="#1a56b0")
+        self.tree.tag_configure("warn", foreground="#a15c00")
         scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll.set)
         self.tree.pack(side="left", fill="both", expand=True)
@@ -84,8 +97,12 @@ class App:
         ttk.Button(buttons, text="Show in folder", command=self.show_in_folder).pack(side="right")
         ttk.Button(buttons, text="Logs", command=self.show_logs).pack(side="right", padx=(0, 8))
 
+        root.report_callback_exception = self.report_error
+        threading.excepthook = lambda a: self.events.put(
+            ("error", {"text": "".join(traceback.format_exception(a.exc_type, a.exc_value, a.exc_traceback))}))
         root.after(100, self.pump)
-        threading.Thread(target=lambda: self.events.put(("checked", {"problems": bs.check_prerequisites()})),
+        threading.Thread(target=lambda: self.events.put(("checked", {"problems": bs.check_prerequisites(),
+                                                                     "lost": bs.unfinished_batches()})),
                          daemon=True).start()
         if initial_inputs:
             self.load(initial_inputs)
@@ -125,24 +142,50 @@ class App:
         self.rows.clear()
 
         def scan():
-            videos = bs.collect(self.inputs)
-            todo = [v for v in videos if not v.with_suffix(".srt").exists()]
-            durations = {v: bs.video_duration(v) for v in todo}
-            self.events.put(("scanned", {"videos": videos, "todo": todo, "durations": durations}))
+            try:
+                videos = bs.collect(self.inputs)
+                clashes = bs.name_clashes(videos)
+                todo = [v for v in videos if v not in clashes and not v.with_suffix(".srt").exists()]
+                others = {v: names for v in todo if (names := bs.other_captions(v))}
+                durations = {v: bs.video_duration(v) for v in todo}
+            except Exception as e:  # e.g. the drive was unplugged or a folder can't be read
+                log_crash(traceback.format_exc())
+                self.events.put(("scan_failed", {"error": str(e)}))
+                return
+            self.events.put(("scanned", {"videos": videos, "todo": todo, "durations": durations,
+                                         "clashes": clashes, "others": others}))
 
         threading.Thread(target=scan, daemon=True).start()
 
-    def on_scanned(self, videos, todo, durations):
+    def on_scan_failed(self, error):
+        self.summary.config(text=NOTHING_SELECTED)
+        self.set_busy(False)
+        self.notify("Batscribe – couldn't read", f"Couldn't read what you chose:\n\n{error}", error=True)
+
+    def on_scanned(self, videos, todo, durations, clashes, others):
         self.todo, self.durations = todo, durations
         base = Path(self.inputs[0]) if Path(self.inputs[0]).is_dir() else None
         for v in videos:
             label = str(v.relative_to(base)) if base and v.is_relative_to(base) else v.name
-            done = v not in durations
-            self.rows[v] = self.tree.insert("", "end", text=label, tags=("done",) if done else (),
-                                            values=("✔ already done" if done else "waiting",))
+            if v in clashes:
+                status, tag = "⚠ name clash", ("warn",)
+            elif v not in durations:
+                status, tag = "✔ already done", ("done",)
+            else:
+                status, tag = ("waiting (has captions)" if v in others else "waiting"), ()
+            self.rows[v] = self.tree.insert("", "end", text=label, tags=tag, values=(status,))
         where = self.inputs[0] if len(self.inputs) == 1 else f"{len(self.inputs)} items"
-        self.summary.config(text=f"{where}\n{len(videos)} videos · {len(videos) - len(todo)} already captioned · "
-                                 f"{len(todo)} to do ({bs.fmt_dur(sum(durations.values()))} of audio)")
+        text = (f"{where}\n{len(videos)} videos · {len(videos) - len(todo) - len(clashes)} already captioned · "
+                f"{len(todo)} to do ({bs.fmt_dur(sum(durations.values()))} of audio)")
+        if clashes:
+            v, first = next(iter(clashes.items()))
+            text += (f"\n⚠ {len(clashes)} skipped: same name as another video (e.g. {v.name} and {first.name}"
+                     " would share one .srt). Rename one to caption both.")
+        if others:
+            v, names = next(iter(others.items()))
+            text += (f"\n⚠ {len(others)} already have other caption files (e.g. {names[0]}); "
+                     f"they'll still get a new {v.stem}.srt.")
+        self.summary.config(text=text)
         self.progress["value"] = 0
         self.stats.config(text="" if todo else "Nothing to do — every video already has captions.")
         self.set_busy(False)
@@ -172,18 +215,36 @@ class App:
 
     def pump(self):
         """Apply worker events on the UI thread."""
-        while not self.events.empty():
-            kind, info = self.events.get()
-            getattr(self, "on_" + kind)(**info)
-        self.root.after(100, self.pump)
+        try:
+            while not self.events.empty():
+                kind, info = self.events.get()
+                getattr(self, "on_" + kind)(**info)
+        finally:  # keep the window alive even if one event handler fails
+            self.root.after(100, self.pump)
 
     def set_status(self, video, text, tag=()):
         self.tree.item(self.rows[video], values=(text,), tags=tag)
 
-    def on_checked(self, problems):
+    def report_error(self, exc_type, exc, tb):
+        self.on_error("".join(traceback.format_exception(exc_type, exc, tb)))
+
+    def on_error(self, text):
+        log_crash(text)
+        self.notify("Batscribe – unexpected error", f"Something went wrong:\n\n{text.strip().splitlines()[-1]}\n\n"
+                    f"Details were saved to:\n{bs.CRASH_LOG}", error=True)
+
+    def on_checked(self, problems, lost):
         if problems:
             self.notify("Batscribe – setup problem", "Captioning won't work until this is fixed:\n\n"
                         + "\n\n".join(f"• {p}" for p in problems), error=True)
+        if lost:
+            msg = ("The last captioning run ended without finishing — the app crashed, the PC lost power "
+                   f"or restarted, or the window was force-closed:\n\n{lost[-1]}\n\n"
+                   "Captions finished before that are saved. Choose the same folder and press Start to continue.")
+            started = dt.datetime.strptime(lost[-1][:19], "%Y-%m-%d %H:%M:%S").timestamp()
+            if bs.CRASH_LOG.exists() and bs.CRASH_LOG.stat().st_mtime > started:
+                msg += f"\n\nTechnical details may be in:\n{bs.CRASH_LOG}"
+            self.notify("Batscribe – last run didn't finish", msg, error=True)
 
     def on_loading(self, model):
         self.stats.config(text=f"Loading model {model} on the GPU…")
@@ -280,11 +341,13 @@ class App:
                                        "Finished videos are kept; the current one will be redone next time.",
                                        parent=self.root):
                 return
+            bs.log_batch("STOPPED  window closed while running")
             os._exit(0)  # don't wait for the GPU thread
         self.root.destroy()
 
 
 def main():
+    faulthandler.enable(CRASH_FILE)
     ctypes.windll.shcore.SetProcessDpiAwareness(1)  # crisp text on high-DPI screens
     # Identify as Batscribe, not "Python", so a taskbar pin relaunches this app (see create_shortcut.ps1).
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
