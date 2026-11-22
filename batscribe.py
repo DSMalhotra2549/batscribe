@@ -158,18 +158,17 @@ def build_paragraphs(words):
     longer than PARAGRAPH_GAP or once it spans PARAGRAPH_MAX seconds."""
     paragraphs, cur, start, end = [], [], None, None
     for w in words:
-        token = w.word.strip()
-        if not token:
+        if not w.word.strip():
             continue
         if cur and (w.start - end > PARAGRAPH_GAP or w.end - start > PARAGRAPH_MAX):
-            paragraphs.append((start, " ".join(cur)))
+            paragraphs.append((start, "".join(cur).strip()))
             cur = []
         if not cur:
             start = w.start
-        cur.append(token)
+        cur.append(w.word)  # Whisper words carry their own leading space, so "earth" + "-shaking" stays joined
         end = w.end
     if cur:
-        paragraphs.append((start, " ".join(cur)))
+        paragraphs.append((start, "".join(cur).strip()))
     return paragraphs
 
 
