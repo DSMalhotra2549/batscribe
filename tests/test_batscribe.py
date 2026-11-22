@@ -99,6 +99,25 @@ class FormattingTests(unittest.TestCase):
             self.assertEqual(blocks[1], "2\n00:00:02,000 --> 00:00:02,500\nZero length cue.")
             self.assertEqual(list(Path(d).iterdir()), [out])  # no .tmp left behind
 
+    def test_caption_path(self):
+        v = Path("course") / "lesson 1.mp4"
+        self.assertEqual(bs.caption_path(v), Path("course") / "lesson 1.srt")
+        self.assertEqual(bs.caption_path(v, "md"), Path("course") / "lesson 1 transcript.md")
+
+    def test_build_paragraphs_splits_on_long_pause_and_max_length(self):
+        words = [NS(word=" Hello", start=0.0, end=0.5), NS(word=" there.", start=0.6, end=1.0),
+                 NS(word=" After", start=3.5, end=4.0),  # 2.5 s pause -> new paragraph
+                 NS(word=" a", start=4.1, end=4.2)]
+        self.assertEqual(bs.build_paragraphs(words), [(0.0, "Hello there."), (3.5, "After a")])
+        steady = [NS(word=f" w{i}", start=i * 1.0, end=i * 1.0 + 0.8) for i in range(200)]
+        paragraphs = bs.build_paragraphs(steady)
+        self.assertEqual(" ".join(t for _, t in paragraphs), " ".join(f"w{i}" for i in range(200)))
+        self.assertTrue(all(b - a <= bs.PARAGRAPH_MAX for (a, _), (b, _) in zip(paragraphs, paragraphs[1:])))
+
+    def test_fmt_clock(self):
+        self.assertEqual(bs.fmt_clock(0), "0:00:00")
+        self.assertEqual(bs.fmt_clock(3725.9), "1:02:05")
+
 
 class RunBatchTests(unittest.TestCase):
     def setUp(self):
@@ -260,6 +279,26 @@ class RunBatchTests(unittest.TestCase):
         self.assertEqual(len(lost), 1)
         self.assertIn("3 videos", lost[0])
         self.assertEqual(bs.unfinished_batches(), [])
+
+    def test_md_format_writes_transcript_and_no_srt(self):
+        (vid,) = self.videos(a=10)
+        self.assertEqual(self.run_batch([vid], {vid: 10.0}, out_format="md"), 0)
+        md = self.dir / "a transcript.md"
+        self.assertEqual(self.of_kind("done")[0]["srt"], md)
+        self.assertFalse(vid.with_suffix(".srt").exists())
+        text = md.read_text(encoding="utf-8")
+        self.assertTrue(text.startswith(f"# a\n\nSource: {vid}\nDuration: 0:00:10\nModel: large-v3-turbo\n"
+                                        "Language: de\n\n---\n\n[0:00:00] word0 ends here."))
+        self.assertEqual(sorted(f.name for f in self.dir.iterdir()), ["a transcript.md", "a.mp4", "history.log"])
+
+    def test_md_format_skips_videos_with_a_transcript_but_not_with_only_an_srt(self):
+        vids = self.videos(a=10, b=10)
+        (self.dir / "a transcript.md").write_text("made earlier", encoding="utf-8")
+        vids[1].with_suffix(".srt").write_text("subtitles", encoding="utf-8")
+        self.run_batch(vids, {v: 10.0 for v in vids}, out_format="md")
+        self.assertEqual([e["video"] for e in self.of_kind("skipped")], [vids[0]])
+        self.assertTrue((self.dir / "b transcript.md").exists())
+        self.assertEqual(vids[1].with_suffix(".srt").read_text(encoding="utf-8"), "subtitles")
 
     def test_name_clashes_and_other_captions(self):
         a_mp4, a_mkv, b = self.videos(a=1, b=1)[0], self.dir / "a.mkv", self.dir / "b.mp4"

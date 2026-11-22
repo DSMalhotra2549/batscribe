@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Command line: `--format md` writes a Markdown transcript (`<video> transcript.md`: header, then `[h:mm:ss]` paragraphs split at pauses over 2 s) instead of an `.srt`. The default stays `srt`; the desktop app is unchanged.
+
 ## 0.1.0 – 2026-11-22
 
 First public release.

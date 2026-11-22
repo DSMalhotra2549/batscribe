@@ -1,7 +1,9 @@
 """Batscribe: batch-caption every video under a folder with faster-whisper on the GPU.
 
 Usage: python batscribe.py <folder-or-video> [more ...] [--language CODE] [--fast] [--force] [--device auto|cuda|cpu]
-Writes <video>.srt next to each video. Existing .srt files are skipped (resumable).
+                           [--format srt|md]
+Writes <video>.srt (or '<video> transcript.md' with --format md) next to each video.
+Videos that already have one are skipped (resumable).
 """
 import argparse
 import datetime as dt
@@ -27,6 +29,9 @@ MAX_LINE = 42          # chars per subtitle line
 MAX_LINES = 2
 MAX_CUE_SECONDS = 6.0
 MIN_CUE_CHARS_AT_SENTENCE_END = 20
+FORMATS = ("srt", "md")  # Caption file kinds: subtitles, or a readable Markdown transcript
+PARAGRAPH_GAP = 2.0      # md: a pause longer than this (s) starts a new paragraph
+PARAGRAPH_MAX = 90.0     # md: max seconds per paragraph
 # Don't open a console window per ffmpeg/ffprobe call when run from the windowless GUI.
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 # Languages Whisper can transcribe (code -> name). None/"auto" means detect per video.
@@ -134,6 +139,48 @@ def write_srt(cues, out_path: Path):
     os.replace(tmp, out_path)
 
 
+def caption_path(video: Path, out_format: str = "srt") -> Path:
+    """The Caption file of a Video: 'a.mp4' -> 'a.srt', or 'a transcript.md' for out_format 'md'.
+
+    The ' transcript' suffix keeps it from being mistaken for an unrelated 'a.md' beside the Video."""
+    return video.with_name(f"{video.stem} transcript.md") if out_format == "md" else video.with_suffix(".srt")
+
+
+def fmt_clock(seconds: float) -> str:
+    seconds = int(max(0, seconds))
+    return f"{seconds // 3600}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
+
+
+def build_paragraphs(words):
+    """Group word timestamps into transcript paragraphs: (start, text). A paragraph ends at a pause
+    longer than PARAGRAPH_GAP or once it spans PARAGRAPH_MAX seconds."""
+    paragraphs, cur, start, end = [], [], None, None
+    for w in words:
+        token = w.word.strip()
+        if not token:
+            continue
+        if cur and (w.start - end > PARAGRAPH_GAP or w.end - start > PARAGRAPH_MAX):
+            paragraphs.append((start, " ".join(cur)))
+            cur = []
+        if not cur:
+            start = w.start
+        cur.append(token)
+        end = w.end
+    if cur:
+        paragraphs.append((start, " ".join(cur)))
+    return paragraphs
+
+
+def write_transcript(paragraphs, out_path: Path, video: Path, duration: float, model_name: str, language: str):
+    """Markdown transcript: a header, then one '[h:mm:ss] text' paragraph per block."""
+    tmp = out_path.with_name(out_path.name + ".tmp")
+    body = "\n\n".join(f"[{fmt_clock(s)}] {text}" for s, text in paragraphs)
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write(f"# {video.stem}\n\nSource: {video}\nDuration: {fmt_clock(duration)}\n"
+                f"Model: {model_name}\nLanguage: {language}\n\n---\n\n{body}\n")
+    os.replace(tmp, out_path)
+
+
 def video_duration(path: Path) -> float:
     try:
         out = subprocess.run(
@@ -198,15 +245,15 @@ def collect(inputs):
     return sorted(set(vids), key=lambda v: str(v).lower())
 
 
-def name_clashes(videos):
-    """Videos that would write the same .srt as an earlier one (e.g. 'a.mp4' and 'a.mkv'): {video: earlier}."""
+def name_clashes(videos, out_format="srt"):
+    """Videos that would write the same Caption file as an earlier one (e.g. 'a.mp4' and 'a.mkv'): {video: earlier}."""
     owner, clashes = {}, {}
     for v in videos:
-        srt = v.with_suffix(".srt")
-        if srt in owner:
-            clashes[v] = owner[srt]
+        out = caption_path(v, out_format)
+        if out in owner:
+            clashes[v] = owner[out]
         else:
-            owner[srt] = v
+            owner[out] = v
     return clashes
 
 
@@ -321,12 +368,13 @@ def keep_awake(on: bool):
 
 def run_batch(todo, durations, log_path, model_name="large-v3-turbo", compute_type=None,
               on_event=lambda kind, **info: None, should_stop=lambda: False, skip_existing=True, fast=False,
-              language=None, device="auto"):
+              language=None, device="auto", out_format="srt"):
     """Transcribe each video in `todo`, reporting through on_event(kind, **info).
 
     fast=True uses faster-whisper's batched mode: about 2.5x faster, slightly less accurate.
     language is a code from LANGUAGES, or None to detect it per video (from its first chunk).
     device is "cuda", "cpu" or "auto"; compute_type defaults to COMPUTE_TYPES[device].
+    out_format is one of FORMATS: "srt" subtitles, or "md" for a '<video> transcript.md' (see caption_path).
 
     Events: loading, start, progress, done, skipped, failed, finished. A stop request abandons
     the current file (no .srt is written for it); a GPU error stops the batch.
@@ -362,8 +410,9 @@ def run_batch(todo, durations, log_path, model_name="large-v3-turbo", compute_ty
             if should_stop():
                 stopped = True
                 break
-            if skip_existing and vid.with_suffix(".srt").exists():  # e.g. made by another window meanwhile
-                log_history(f"  SKIPPED  {vid}  (already has .srt)")
+            out = caption_path(vid, out_format)
+            if skip_existing and out.exists():  # e.g. made by another window meanwhile
+                log_history(f"  SKIPPED  {vid}  (already has {out.name})")
                 on_event("skipped", n=n, video=vid)
                 done_audio += durations[vid]
                 continue
@@ -401,13 +450,15 @@ def run_batch(todo, durations, log_path, model_name="large-v3-turbo", compute_ty
                 if stopped:
                     log_history(f"  STOPPED  {vid}  (not saved)")
                     break
-                srt = vid.with_suffix(".srt")
-                write_srt(build_cues(words), srt)
+                if out_format == "md":
+                    write_transcript(build_paragraphs(words), out, vid, dur, model_name, lang)
+                else:
+                    write_srt(build_cues(words), out)
                 ok += 1
                 took = time.time() - t_file
                 log_history(f"  OK       {vid}  ({fmt_dur(dur)} of audio in {fmt_dur(took)}, "
                             f"{dur / max(took, 0.001):.1f}x realtime, language {lang})")
-                on_event("done", n=n, video=vid, srt=srt)
+                on_event("done", n=n, video=vid, srt=out)
             except Exception as e:
                 failures += 1
                 on_event("failed", n=n, video=vid, error=str(e))
@@ -445,7 +496,7 @@ def print_event(kind, **e):
     elif kind == "done":
         print(f"\r   done -> {e['srt'].name}" + " " * 40)
     elif kind == "skipped":
-        print("   skipped (an .srt appeared meanwhile)")
+        print("   skipped (its caption file appeared meanwhile)")
     elif kind == "failed":
         print(f"\n   FAILED: {e['error']}")
     elif kind == "finished":
@@ -472,8 +523,10 @@ def main():
     ap.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"],
                     help="auto = NVIDIA GPU if available, else CPU (much slower)")
     ap.add_argument("--compute-type", default=None, help="CTranslate2 precision (default: int8_float16 on GPU, int8 on CPU)")
-    ap.add_argument("--force", action="store_true", help="redo videos that already have .srt")
+    ap.add_argument("--force", action="store_true", help="redo videos that already have a caption file")
     ap.add_argument("--fast", action="store_true", help="batched mode: about 2.5x faster, slightly less accurate")
+    ap.add_argument("--format", default="srt", choices=FORMATS,
+                    help="srt = subtitles (default); md = '<video> transcript.md', timestamped paragraphs")
     args = ap.parse_args()
 
     problems = check_prerequisites(args.device)
@@ -487,10 +540,11 @@ def main():
         print(f"Note: a previous run ended without finishing (crash, power loss or window closed):\n  {line}")
 
     videos = collect(args.inputs)
-    clashes = name_clashes(videos)
+    clashes = name_clashes(videos, args.format)
     for v, first in clashes.items():
-        print(f"!! Skipping {v}: same name as {first.name}, so both would use the same .srt. Rename one of them.")
-    todo = [v for v in videos if v not in clashes and (args.force or not v.with_suffix(".srt").exists())]
+        print(f"!! Skipping {v}: same name as {first.name}, so both would use the same "
+              f"{caption_path(v, args.format).name}. Rename one of them.")
+    todo = [v for v in videos if v not in clashes and (args.force or not caption_path(v, args.format).exists())]
     print(f"Found {len(videos)} videos, {len(videos) - len(todo) - len(clashes)} already captioned, {len(todo)} to do.")
     if not todo:
         return 0
@@ -501,7 +555,8 @@ def main():
     try:
         failures = run_batch(todo, durations, ERROR_LOG, args.model, args.compute_type,
                              on_event=print_event, skip_existing=not args.force, fast=args.fast,
-                             language=None if args.language == "auto" else args.language, device=args.device)
+                             language=None if args.language == "auto" else args.language, device=args.device,
+                             out_format=args.format)
     except KeyboardInterrupt:
         print("\nStopped. Rerun to continue where you left off.")
         return 130

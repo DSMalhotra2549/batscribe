@@ -90,7 +90,8 @@ Drag a folder (or video files) onto `captions.bat`. A console window shows progr
 |---|---|
 | `--language CODE` | Spoken language, e.g. `en`, `de`, `es`, `ja` (default `auto`: detect per video) |
 | `--fast` | Fast mode: about 2.5x faster, slightly less accurate |
-| `--force` | Redo videos that already have an `.srt` |
+| `--force` | Redo videos that already have an `.srt` (or a transcript, with `--format md`) |
+| `--format srt\|md` | `srt` (default) writes subtitles. `md` writes `<video> transcript.md` instead: a readable transcript with a header and `[h:mm:ss]` timestamped paragraphs, for reading, searching or pasting into notes. Each format is resumable on its own |
 | `--device auto\|cuda\|cpu` | Where to run (default `auto`: NVIDIA GPU if found, otherwise CPU) |
 | `--model NAME` | Whisper model (default `large-v3-turbo`) |
 | `--compute-type T` | CTranslate2 precision (default `int8_float16` on GPU, `int8` on CPU) |

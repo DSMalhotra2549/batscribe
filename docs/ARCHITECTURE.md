@@ -22,9 +22,9 @@ Read [`CONTEXT.md`](../CONTEXT.md) first for the vocabulary (Video, Caption file
 1. **Setup check** – `check_prerequisites(device)` returns human-readable Setup problems (ffmpeg/ffprobe on PATH, `ctranslate2` importable, and a CUDA device only if `device="cuda"` was explicitly requested). A missing GPU is not a problem with `device="auto"`: `resolve_device()` falls back to the CPU and the front ends warn that it will be slow (`cuda_available()`).
 2. **Crash report** – `unfinished_batches()` finds Crashed batches in the History log (ADR 0006).
 3. **Scan** – `collect(inputs)` → sorted, de-duplicated Videos (`VIDEO_EXTS`, recursive). `name_clashes()` drops Name clashes; Captioned Videos are dropped unless Redo. The GUI also calls `other_captions()` to warn. `video_duration()` (ffprobe) gives the estimate for progress; 0.0 on failure.
-4. **`run_batch(todo, durations, log_path, ..., on_event, should_stop, skip_existing, fast, language, device)`** – the shared core used by both front ends (both pass `ERROR_LOG` as `log_path`):
+4. **`run_batch(todo, durations, log_path, ..., on_event, should_stop, skip_existing, fast, language, device, out_format)`** – the shared core used by both front ends (both pass `ERROR_LOG` as `log_path`):
    - keeps Windows awake (`keep_awake`), makes pip-installed CUDA DLLs loadable (`add_cuda_dll_dirs`), resolves the device, logs `BATCH START`, loads `WhisperModel` (`large-v3-turbo`; `COMPUTE_TYPES[device]` unless overridden), optionally wraps it in `BatchedInferencePipeline` (Fast mode).
-   - per Video: re-check for an existing `.srt` (skip) → `load_audio()` (ffmpeg → float32 array, ADR 0002) → `chunk_bounds()` (ADR 0003) → transcribe each Chunk, offsetting word timestamps → `build_cues()` → `write_srt()` (atomic, ADR 0001).
+   - per Video: re-check for an existing Caption file, `caption_path(video, out_format)` (skip) → `load_audio()` (ffmpeg → float32 array, ADR 0002) → `chunk_bounds()` (ADR 0003) → transcribe each Chunk, offsetting word timestamps → `build_cues()` → `write_srt()` (atomic, ADR 0001), or with `out_format="md"` → `build_paragraphs()` → `write_transcript()` (also atomic).
    - language: `None` means auto-detect. Whisper detects it on the Video's first Chunk (`info.language`), and that language is then passed explicitly for the remaining Chunks so one Video can't switch language midway. Codes are the keys of `LANGUAGES` (a test checks they match faster-whisper's list).
    - a stop request is checked between segments; the current Video is abandoned unsaved.
    - exceptions: logged to the Error log and History log; `is_gpu_error()` stops the Batch (ADR 0005).
@@ -39,7 +39,7 @@ Read [`CONTEXT.md`](../CONTEXT.md) first for the vocabulary (Video, Caption file
 | `loading` | `model, device` |
 | `start` | `n, total, video, duration` |
 | `progress` | `n, video, file_pct, overall_pct, speed, eta` |
-| `done` | `n, video, srt` |
+| `done` | `n, video, srt` (the Caption file written: `.srt`, or the `.md` transcript) |
 | `skipped` | `n, video` |
 | `failed` | `n, video, error` |
 | `finished` | `ok, failed, stopped, gpu_error, elapsed, log_path` |
@@ -50,9 +50,11 @@ The CLI handles these in `print_event`. The GUI runs `run_batch` on a worker thr
 
 `build_cues` groups words into Cues, starting a new one when the text would exceed `MAX_LINE * MAX_LINES` (42 × 2) characters, the Cue would exceed `MAX_CUE_SECONDS` (6 s), or there is a gap > 1 s; it also ends a Cue at sentence punctuation once it has ≥ 20 characters. `wrap_lines` splits a Cue into two lines at the space nearest the middle. `write_srt` forces a 0.5 s minimum on zero-length Cues.
 
+For `--format md`, `build_paragraphs` groups the same words into paragraphs instead, starting a new one after a pause > `PARAGRAPH_GAP` (2 s) or once it spans `PARAGRAPH_MAX` (90 s). `write_transcript` writes a header (title, source, duration, model, language), a `---` rule, then one `[h:mm:ss] text` paragraph per block.
+
 ## Invariants to keep
 
-- A `.srt` beside a Video means "done". Never write it non-atomically, never write a partial one, never touch Other caption files.
+- A `.srt` (or, for `md`, a `<video> transcript.md`) beside a Video means "done". Never write it non-atomically, never write a partial one, never touch Other caption files.
 - `batscribe.py` must stay usable without the GUI and without a console (the GUI runs under `pythonw`): subprocesses use `NO_WINDOW`, and stdout/stderr are reconfigured to UTF-8 only in the CLI `main()`.
 - A log write failure must never stop a Batch (`log_history` and the Error log swallow `OSError`).
 - Filenames may contain emoji/Unicode and spaces; always pass paths as list arguments, never through a shell string.

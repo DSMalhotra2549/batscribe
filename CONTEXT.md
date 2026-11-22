@@ -22,6 +22,7 @@ _Avoid_: Duplicate
 
 **Caption file**:
 The `<video name>.srt` written next to a Video. Its existence is the only record that the Video is done.
+With `--format md` (command line only) it is `<video name> transcript.md` instead: a Markdown transcript of timestamped paragraphs. Each format is its own record, so an `.srt` does not make a Video done for `md`, and vice versa.
 _Avoid_: Subtitle, transcript, output
 
 **Other caption file**:
