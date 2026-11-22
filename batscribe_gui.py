@@ -24,12 +24,18 @@ NOTHING_SELECTED = "Nothing selected yet."
 APP_ID = "Batscribe.Captions"  # must match create_shortcut.ps1
 # pythonw has no console, so errors would otherwise vanish. faulthandler also writes here if the
 # process itself crashes (e.g. inside the GPU engine).
-CRASH_FILE = open(bs.CRASH_LOG, "a", encoding="utf-8")
+try:
+    CRASH_FILE = open(bs.CRASH_LOG, "a", encoding="utf-8")
+except OSError:
+    CRASH_FILE = None  # the app must still open if the log folder isn't writable
+AUTO_LANGUAGE = "Auto-detect"
+LANGUAGE_CODES = {name: code for code, name in sorted(bs.LANGUAGES.items(), key=lambda kv: kv[1])}
 
 
 def log_crash(text):
-    CRASH_FILE.write(f"--- {dt.datetime.now():%Y-%m-%d %H:%M:%S}\n{text}\n")
-    CRASH_FILE.flush()
+    if CRASH_FILE:
+        CRASH_FILE.write(f"--- {dt.datetime.now():%Y-%m-%d %H:%M:%S}\n{text}\n")
+        CRASH_FILE.flush()
 
 
 class App:
@@ -44,7 +50,7 @@ class App:
         self.current = ""
 
         root.title("Batscribe")
-        root.geometry("680x580")
+        root.geometry("680x620")
         root.minsize(480, 400)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         root.drop_target_register(DND_FILES)
@@ -89,6 +95,13 @@ class App:
 
         options = ttk.Frame(root)
         options.pack(fill="x", padx=12, pady=(10, 0))
+        lang_row = ttk.Frame(options)
+        lang_row.pack(anchor="w", pady=(0, 4))
+        ttk.Label(lang_row, text="Spoken language:").pack(side="left")
+        self.language = tk.StringVar(value=AUTO_LANGUAGE)
+        self.language_box = ttk.Combobox(lang_row, textvariable=self.language, state="readonly", width=22,
+                                         values=[AUTO_LANGUAGE, *LANGUAGE_CODES])
+        self.language_box.pack(side="left", padx=(6, 0))
         self.fast = tk.BooleanVar()
         self.fast_box = ttk.Checkbutton(options, text="Fast mode (about 2.5x faster, slightly less accurate)",
                                         variable=self.fast)
@@ -114,7 +127,8 @@ class App:
             ("error", {"text": "".join(traceback.format_exception(a.exc_type, a.exc_value, a.exc_traceback))}))
         root.after(100, self.pump)
         threading.Thread(target=lambda: self.events.put(("checked", {"problems": bs.check_prerequisites(),
-                                                                     "lost": bs.unfinished_batches()})),
+                                                                     "lost": bs.unfinished_batches(),
+                                                                     "gpu": bs.cuda_available()})),
                          daemon=True).start()
         if initial_inputs:
             self.load(initial_inputs)
@@ -220,10 +234,10 @@ class App:
 
         def work():
             try:
-                bs.run_batch(self.todo, self.durations, bs.error_log_path(self.inputs[0]),
+                bs.run_batch(self.todo, self.durations, bs.ERROR_LOG,
                              on_event=lambda kind, **info: self.events.put((kind, info)),
                              should_stop=self.stop_flag.is_set, skip_existing=not self.redo.get(),
-                             fast=self.fast.get())
+                             fast=self.fast.get(), language=LANGUAGE_CODES.get(self.language.get()))
             except Exception as e:  # e.g. model/GPU failed to load
                 self.events.put(("crashed", {"error": str(e)}))
 
@@ -254,10 +268,14 @@ class App:
         self.notify("Batscribe – unexpected error", f"Something went wrong:\n\n{text.strip().splitlines()[-1]}\n\n"
                     f"Details were saved to:\n{bs.CRASH_LOG}", error=True)
 
-    def on_checked(self, problems, lost):
+    def on_checked(self, problems, lost, gpu):
         if problems:
             self.notify("Batscribe – setup problem", "Captioning won't work until this is fixed:\n\n"
                         + "\n\n".join(f"• {p}" for p in problems), error=True)
+        elif not gpu:
+            self.notify("Batscribe – no NVIDIA GPU", "No NVIDIA GPU (CUDA) was found, so captioning will run on the "
+                        "CPU. That works, but is roughly 10x slower: a 1-hour video may take 30–60 minutes "
+                        "depending on your processor.\n\nIf you do have an NVIDIA GPU, update its driver.")
         if lost:
             msg = ("The last captioning run ended without finishing — the app crashed, the PC lost power "
                    f"or restarted, or the window was force-closed:\n\n{lost[-1]}\n\n"
@@ -267,8 +285,8 @@ class App:
                 msg += f"\n\nTechnical details may be in:\n{bs.CRASH_LOG}"
             self.notify("Batscribe – last run didn't finish", msg, error=True)
 
-    def on_loading(self, model):
-        self.stats.config(text=f"Loading model {model} on the GPU…")
+    def on_loading(self, model, device):
+        self.stats.config(text=f"Loading model {model} on the {'GPU' if device == 'cuda' else 'CPU'}…")
 
     def on_start(self, n, total, video, duration):
         self.set_status(video, "▶ starting…", ("active",))
@@ -333,6 +351,7 @@ class App:
         self.busy = busy
         for btn in (self.browse_btn, self.files_btn, self.new_btn, self.fast_box, self.redo_box):
             btn.config(state="disabled" if busy else "normal")
+        self.language_box.config(state="disabled" if busy else "readonly")
         self.start_btn.config(state="disabled" if busy or not self.todo else "normal")
         if not busy:
             self.stop_btn.config(state="disabled")
@@ -370,7 +389,8 @@ class App:
 
 
 def main():
-    faulthandler.enable(CRASH_FILE)
+    if CRASH_FILE:
+        faulthandler.enable(CRASH_FILE)
     ctypes.windll.shcore.SetProcessDpiAwareness(1)  # crisp text on high-DPI screens
     # Identify as Batscribe, not "Python", so a taskbar pin relaunches this app (see create_shortcut.ps1).
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)

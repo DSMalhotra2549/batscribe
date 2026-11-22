@@ -1,6 +1,6 @@
 # Architecture (for agents and contributors)
 
-Read [`CONTEXT.md`](../CONTEXT.md) first for the vocabulary (Video, Caption file, Batch, Redo, Chunk, …) and use those terms in code, comments and messages. Decisions that look odd are explained in [`docs/adr/`](adr/). [`BATSCRIBE_PLAN.md`](../BATSCRIBE_PLAN.md) is the dated progress log of how the project got here.
+Read [`CONTEXT.md`](../CONTEXT.md) first for the vocabulary (Video, Caption file, Batch, Redo, Chunk, …) and use those terms in code, comments and messages. Decisions that look odd are explained in [`docs/adr/`](adr/). User-visible changes go in [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## Files
 
@@ -12,16 +12,20 @@ Read [`CONTEXT.md`](../CONTEXT.md) first for the vocabulary (Video, Caption file
 | `create_shortcut.ps1` | Creates `Batscribe.lnk` (app folder + Start menu) with the icon and AppUserModelID. Machine-specific, so `*.lnk` is gitignored. |
 | `make_icon.py` | Draws `batscribe.png` and `batscribe.ico` (quill on blue tile). Needs Pillow, which is not in `requirements.txt`. |
 | `tests/test_batscribe.py` | Unit tests with a fake model and fake audio. No GPU, ffmpeg or media needed. |
-| `requirements.txt` | Exact pinned versions known to work (Python 3.12, Windows). |
+| `requirements.txt` | Minimum versions; the default install. |
+| `requirements-lock.txt` | Exact pinned versions known to work (Python 3.12, Windows, NVIDIA GPU). Refresh it when you upgrade a dependency and have verified a real GPU run. |
+| `.github/workflows/tests.yml` | CI: runs the unit tests on Windows with only numpy installed. |
+| `docs/images/screenshot.png` | README screenshot (demo folder, not real data). |
 
 ## Flow of one Batch (`batscribe.py`)
 
-1. **Setup check** – `check_prerequisites()` returns human-readable Setup problems (ffmpeg/ffprobe on PATH, CUDA device via `ctranslate2`).
+1. **Setup check** – `check_prerequisites(device)` returns human-readable Setup problems (ffmpeg/ffprobe on PATH, `ctranslate2` importable, and a CUDA device only if `device="cuda"` was explicitly requested). A missing GPU is not a problem with `device="auto"`: `resolve_device()` falls back to the CPU and the front ends warn that it will be slow (`cuda_available()`).
 2. **Crash report** – `unfinished_batches()` finds Crashed batches in the History log (ADR 0006).
 3. **Scan** – `collect(inputs)` → sorted, de-duplicated Videos (`VIDEO_EXTS`, recursive). `name_clashes()` drops Name clashes; Captioned Videos are dropped unless Redo. The GUI also calls `other_captions()` to warn. `video_duration()` (ffprobe) gives the estimate for progress; 0.0 on failure.
-4. **`run_batch(todo, durations, log_path, ..., on_event, should_stop, skip_existing, fast)`** – the shared core used by both front ends:
-   - keeps Windows awake (`keep_awake`), logs `BATCH START`, makes pip-installed CUDA DLLs loadable (`add_cuda_dll_dirs`), loads `WhisperModel` (`large-v3-turbo`, `int8_float16`, CUDA), optionally wraps it in `BatchedInferencePipeline` (Fast mode).
+4. **`run_batch(todo, durations, log_path, ..., on_event, should_stop, skip_existing, fast, language, device)`** – the shared core used by both front ends (both pass `ERROR_LOG` as `log_path`):
+   - keeps Windows awake (`keep_awake`), makes pip-installed CUDA DLLs loadable (`add_cuda_dll_dirs`), resolves the device, logs `BATCH START`, loads `WhisperModel` (`large-v3-turbo`; `COMPUTE_TYPES[device]` unless overridden), optionally wraps it in `BatchedInferencePipeline` (Fast mode).
    - per Video: re-check for an existing `.srt` (skip) → `load_audio()` (ffmpeg → float32 array, ADR 0002) → `chunk_bounds()` (ADR 0003) → transcribe each Chunk, offsetting word timestamps → `build_cues()` → `write_srt()` (atomic, ADR 0001).
+   - language: `None` means auto-detect. Whisper detects it on the Video's first Chunk (`info.language`), and that language is then passed explicitly for the remaining Chunks so one Video can't switch language midway. Codes are the keys of `LANGUAGES` (a test checks they match faster-whisper's list).
    - a stop request is checked between segments; the current Video is abandoned unsaved.
    - exceptions: logged to the Error log and History log; `is_gpu_error()` stops the Batch (ADR 0005).
    - returns the number of Failed videos; logs `BATCH END`/`STOPPED`, or `ABORTED` and re-raises if the model fails to load or on Ctrl+C.
@@ -32,7 +36,7 @@ Read [`CONTEXT.md`](../CONTEXT.md) first for the vocabulary (Video, Caption file
 
 | kind | info |
 |---|---|
-| `loading` | `model` |
+| `loading` | `model, device` |
 | `start` | `n, total, video, duration` |
 | `progress` | `n, video, file_pct, overall_pct, speed, eta` |
 | `done` | `n, video, srt` |
@@ -53,16 +57,19 @@ The CLI handles these in `print_event`. The GUI runs `run_batch` on a worker thr
 - A log write failure must never stop a Batch (`log_history` and the Error log swallow `OSError`).
 - Filenames may contain emoji/Unicode and spaces; always pass paths as list arguments, never through a shell string.
 - ffmpeg/ffprobe calls keep `-protocol_whitelist file`.
-- Language is forced to English (`language="en"`).
+- All logs live in `DATA_DIR` (`%LOCALAPPDATA%\Batscribe`), never in the app folder or the user's video folders, so a read-only install or read-only media still works.
+- Nothing personal goes into the repo: screenshots and examples use demo data and neutral paths.
 
 ## Setup and testing
 
 ```powershell
 py -3.12 -m venv .venv
-.venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv\Scripts\python.exe -m pip install -r requirements-lock.txt
 .venv\Scripts\python.exe -m unittest discover tests
 ```
 
 Tests replace `bs.load_audio`, `bs.HISTORY_LOG`, `bs.add_cuda_dll_dirs` and `sys.modules["faster_whisper"]`; a fake audio file's content is its length in seconds. To make a video fail on purpose, set `FakeModel.fail_on = {"<stem>": "<message>"}` (include `CUDA` in the message to simulate a GPU error). Set `bs.CHUNK_SECONDS` small to exercise chunking.
+
+`FakeModel` "detects" German when no language is given and records each call's language in `FakeModel.languages` and its constructor arguments in `FakeModel.init_kwargs`.
 
 The GUI and real-GPU behaviour have no automated tests; verify by hand (`.venv\Scripts\pythonw.exe batscribe_gui.py`) when you change them.

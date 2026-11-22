@@ -23,12 +23,15 @@ class FakeModel:
     """Stands in for faster_whisper.WhisperModel: one 4-second segment of two words at a time."""
     fail_on = {}  # file stem -> exception message raised when that video is transcribed
     calls = 0
+    languages = []  # the language argument of each transcribe call
+    init_kwargs = {}
 
     def __init__(self, *args, **kwargs):
-        pass
+        FakeModel.init_kwargs = kwargs
 
     def transcribe(self, audio, **kwargs):
         FakeModel.calls += 1
+        FakeModel.languages.append(kwargs.get("language"))
         if audio.name in self.fail_on:
             raise RuntimeError(self.fail_on[audio.name])
         dur = len(audio) / SR
@@ -40,7 +43,7 @@ class FakeModel:
                 yield NS(start=t, end=e, words=[NS(word=f" word{i}", start=t, end=t + 1.5),
                                                 NS(word=" ends here.", start=t + 1.6, end=e)])
                 t, i = e, i + 1
-        return segments(), NS(duration=dur)
+        return segments(), NS(duration=dur, language=kwargs.get("language") or "de")  # "detects" German
 
 
 class FakeBatched:
@@ -52,7 +55,7 @@ class FakeBatched:
 
     def transcribe(self, audio, **kwargs):
         FakeBatched.calls += 1
-        return self.model.transcribe(audio)
+        return self.model.transcribe(audio, **kwargs)
 
 
 class FakeAudio(np.ndarray):
@@ -107,7 +110,7 @@ class RunBatchTests(unittest.TestCase):
         self.old_fw = sys.modules.get("faster_whisper")
         sys.modules["faster_whisper"] = types.SimpleNamespace(WhisperModel=FakeModel,
                                                               BatchedInferencePipeline=FakeBatched)
-        FakeModel.fail_on, FakeModel.calls, FakeBatched.calls = {}, 0, 0
+        FakeModel.fail_on, FakeModel.calls, FakeBatched.calls, FakeModel.languages = {}, 0, 0, []
         self.events = []
 
     def tearDown(self):
@@ -218,6 +221,26 @@ class RunBatchTests(unittest.TestCase):
         self.assertGreater(starts[-1], "00:00:45")  # the last chunk's cues are offset, not restarted at 0
         self.assertGreater(self.of_kind("progress")[-1]["file_pct"], 99)
 
+    def test_language_detected_on_first_chunk_is_kept_for_the_rest(self):
+        bs.CHUNK_SECONDS = 20
+        vids = self.videos(a=50, b=10)
+        self.run_batch(vids, {v: float(v.read_text()) for v in vids})
+        # each video detects afresh on its first chunk, then reuses that language
+        self.assertEqual(FakeModel.languages, [None, "de", "de", None])
+        self.assertIn("language de", bs.HISTORY_LOG.read_text(encoding="utf-8"))
+
+    def test_chosen_language_is_passed_to_every_chunk(self):
+        bs.CHUNK_SECONDS = 20
+        (vid,) = self.videos(a=50)
+        self.run_batch([vid], {vid: 50.0}, language="en", fast=True)
+        self.assertEqual(FakeModel.languages, ["en", "en", "en"])
+
+    def test_cpu_device_uses_cpu_compute_type(self):
+        (vid,) = self.videos(a=10)
+        self.run_batch([vid], {vid: 10.0}, device="cpu")
+        self.assertEqual(FakeModel.init_kwargs, {"device": "cpu", "compute_type": "int8"})
+        self.assertEqual(self.of_kind("loading")[0]["device"], "cpu")
+
     def test_unwritable_error_log_does_not_abort_the_batch(self):
         vids = self.videos(bad=10, c=10)
         FakeModel.fail_on = {"bad": "Invalid data found when processing input"}
@@ -275,6 +298,27 @@ class PrerequisiteTests(unittest.TestCase):
             bs.shutil.which = original
         self.assertTrue(any("ffmpeg was not found" in p for p in problems))
         self.assertTrue(any("ffprobe was not found" in p for p in problems))
+
+    def test_no_gpu_falls_back_to_cpu_unless_cuda_is_required(self):
+        original = bs.cuda_available
+        bs.cuda_available = lambda: False
+        try:
+            self.assertEqual(bs.resolve_device("auto"), "cpu")
+            self.assertEqual(bs.resolve_device("cuda"), "cuda")
+            self.assertFalse(any("GPU" in p for p in bs.check_prerequisites("auto")))
+            if "could not be loaded" not in " ".join(bs.check_prerequisites("cuda")):  # engine installed
+                self.assertTrue(any("No NVIDIA GPU" in p for p in bs.check_prerequisites("cuda")))
+        finally:
+            bs.cuda_available = original
+
+
+class LanguageTests(unittest.TestCase):
+    def test_language_list_matches_whisper(self):
+        try:
+            from faster_whisper.tokenizer import _LANGUAGE_CODES
+        except ImportError:
+            self.skipTest("faster-whisper not installed")
+        self.assertEqual(set(bs.LANGUAGES), set(_LANGUAGE_CODES))
 
 
 if __name__ == "__main__":

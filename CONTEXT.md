@@ -1,6 +1,6 @@
 # Batscribe
 
-Batscribe turns a folder of videos into subtitle files: every video gets its own `.srt` beside it, so a normal video player shows captions automatically. It runs locally on an NVIDIA GPU, in batches that can be stopped and continued.
+Batscribe turns a folder of videos into subtitle files: every video gets its own `.srt` beside it, so a normal video player shows captions automatically. It runs locally (on an NVIDIA GPU, or more slowly on the CPU), in batches that can be stopped and continued.
 
 ## Language
 
@@ -54,6 +54,14 @@ _Avoid_: Accurate mode, slow mode
 An opt-in way of transcribing about 2.5x faster with slightly worse accuracy.
 _Avoid_: Batched mode, turbo
 
+**Spoken language**:
+The language the Video's speech is in, either chosen by the user for the whole Batch or detected once per Video ("Auto-detect").
+_Avoid_: Locale, subtitle language
+
+**Device**:
+Where transcription runs: the NVIDIA GPU, or the CPU as a much slower fallback when no GPU is found.
+_Avoid_: Backend, accelerator
+
 **Chunk**:
 A piece of a long Video's audio (at most 10 minutes) transcribed on its own; Chunks are stitched back into one Caption file.
 _Avoid_: Segment, part
@@ -81,17 +89,19 @@ A Batch whose process died without recording an end (hard crash, power loss, con
 _Avoid_: Unfinished batch, lost batch
 
 **Setup problem**:
-A missing prerequisite (ffmpeg, ffprobe, or a usable NVIDIA GPU) that would make every Video fail, checked before a Batch can start.
+A missing prerequisite (ffmpeg, ffprobe, or the transcription engine) that would make every Video fail, checked before a Batch can start. A missing GPU is not one; it means running on the CPU.
 _Avoid_: Prerequisite error, environment issue
 
 ### Records
 
+All three live in the user's data folder (`%LOCALAPPDATA%\Batscribe`).
+
 **Error log**:
-`batscribe_errors.log` in the first Input's folder: full details of each Failed video.
+`batscribe_errors.log`: full details of each Failed video.
 
 **History log**:
-`batscribe_history.log` in the app folder: one line per Batch start/end and per Video outcome, shared by the command line and the window.
+`batscribe_history.log`: one line per Batch start/end and per Video outcome, shared by the command line and the window.
 _Avoid_: Activity log, run log
 
 **Crash log**:
-`batscribe_crash.log` in the app folder: unexpected errors and native crashes of the window app.
+`batscribe_crash.log`: unexpected errors and native crashes of the window app.

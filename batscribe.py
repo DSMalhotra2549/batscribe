@@ -1,6 +1,6 @@
 """Batscribe: batch-caption every video under a folder with faster-whisper on the GPU.
 
-Usage: python batscribe.py <folder-or-video> [more ...] [--model NAME] [--force]
+Usage: python batscribe.py <folder-or-video> [more ...] [--language CODE] [--fast] [--force] [--device auto|cuda|cpu]
 Writes <video>.srt next to each video. Existing .srt files are skipped (resumable).
 """
 import argparse
@@ -29,6 +29,27 @@ MAX_CUE_SECONDS = 6.0
 MIN_CUE_CHARS_AT_SENTENCE_END = 20
 # Don't open a console window per ffmpeg/ffprobe call when run from the windowless GUI.
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+# Languages Whisper can transcribe (code -> name). None/"auto" means detect per video.
+LANGUAGES = {
+    "af": "Afrikaans", "am": "Amharic", "ar": "Arabic", "as": "Assamese", "az": "Azerbaijani", "ba": "Bashkir",
+    "be": "Belarusian", "bg": "Bulgarian", "bn": "Bengali", "bo": "Tibetan", "br": "Breton", "bs": "Bosnian",
+    "ca": "Catalan", "cs": "Czech", "cy": "Welsh", "da": "Danish", "de": "German", "el": "Greek", "en": "English",
+    "es": "Spanish", "et": "Estonian", "eu": "Basque", "fa": "Persian", "fi": "Finnish", "fo": "Faroese",
+    "fr": "French", "gl": "Galician", "gu": "Gujarati", "ha": "Hausa", "haw": "Hawaiian", "he": "Hebrew",
+    "hi": "Hindi", "hr": "Croatian", "ht": "Haitian Creole", "hu": "Hungarian", "hy": "Armenian", "id": "Indonesian",
+    "is": "Icelandic", "it": "Italian", "ja": "Japanese", "jw": "Javanese", "ka": "Georgian", "kk": "Kazakh",
+    "km": "Khmer", "kn": "Kannada", "ko": "Korean", "la": "Latin", "lb": "Luxembourgish", "ln": "Lingala",
+    "lo": "Lao", "lt": "Lithuanian", "lv": "Latvian", "mg": "Malagasy", "mi": "Maori", "mk": "Macedonian",
+    "ml": "Malayalam", "mn": "Mongolian", "mr": "Marathi", "ms": "Malay", "mt": "Maltese", "my": "Burmese",
+    "ne": "Nepali", "nl": "Dutch", "nn": "Norwegian Nynorsk", "no": "Norwegian", "oc": "Occitan", "pa": "Punjabi",
+    "pl": "Polish", "ps": "Pashto", "pt": "Portuguese", "ro": "Romanian", "ru": "Russian", "sa": "Sanskrit",
+    "sd": "Sindhi", "si": "Sinhala", "sk": "Slovak", "sl": "Slovenian", "sn": "Shona", "so": "Somali",
+    "sq": "Albanian", "sr": "Serbian", "su": "Sundanese", "sv": "Swedish", "sw": "Swahili", "ta": "Tamil",
+    "te": "Telugu", "tg": "Tajik", "th": "Thai", "tk": "Turkmen", "tl": "Tagalog", "tr": "Turkish", "tt": "Tatar",
+    "uk": "Ukrainian", "ur": "Urdu", "uz": "Uzbek", "vi": "Vietnamese", "yi": "Yiddish", "yo": "Yoruba",
+    "yue": "Cantonese", "zh": "Chinese",
+}
+COMPUTE_TYPES = {"cuda": "int8_float16", "cpu": "int8"}  # int8_float16 fits large-v3-turbo in 6 GB VRAM
 
 
 def add_cuda_dll_dirs():
@@ -196,13 +217,15 @@ def other_captions(video):
                   if f.suffix.lower() in CAPTION_EXTS and f.name.lower().startswith(prefix) and f != own)
 
 
-def error_log_path(first_input) -> Path:
-    root = Path(str(first_input).strip('"'))
-    return (root if root.is_dir() else root.parent) / "batscribe_errors.log"
-
-
-HISTORY_LOG = Path(__file__).with_name("batscribe_history.log")
-CRASH_LOG = Path(__file__).with_name("batscribe_crash.log")
+# Logs live in a per-user folder, so the app also works from a read-only install folder.
+DATA_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".local" / "state") / "Batscribe"
+try:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+except OSError:
+    pass  # logging then fails quietly; captioning still works
+ERROR_LOG = DATA_DIR / "batscribe_errors.log"
+HISTORY_LOG = DATA_DIR / "batscribe_history.log"
+CRASH_LOG = DATA_DIR / "batscribe_crash.log"
 
 
 def log_history(line: str):
@@ -254,17 +277,33 @@ def unfinished_batches():
     return list(lost.values())
 
 
-def check_prerequisites():
+def check_prerequisites(device="auto"):
     """Return a list of human-readable problems that would make every video fail."""
     problems = [f"{tool} was not found. Install ffmpeg and make sure it is on PATH."
                 for tool in ("ffmpeg", "ffprobe") if not shutil.which(tool)]
     try:
-        import ctranslate2
-        if ctranslate2.get_cuda_device_count() == 0:
-            problems.append("No NVIDIA GPU (CUDA) was found. Update the NVIDIA driver or check the GPU is enabled.")
+        import ctranslate2  # noqa: F401
     except Exception as e:
         problems.append(f"The transcription engine could not be loaded: {e}")
+        return problems
+    if device == "cuda" and not cuda_available():
+        problems.append("No NVIDIA GPU (CUDA) was found. Update the NVIDIA driver or check the GPU is enabled.")
     return problems
+
+
+def cuda_available() -> bool:
+    try:
+        import ctranslate2
+        return ctranslate2.get_cuda_device_count() > 0
+    except Exception:
+        return False
+
+
+def resolve_device(device: str) -> str:
+    """'auto' means the NVIDIA GPU if there is one, otherwise the (much slower) CPU."""
+    if device != "auto":
+        return device
+    return "cuda" if cuda_available() else "cpu"
 
 
 def is_gpu_error(e: Exception) -> bool:
@@ -280,11 +319,14 @@ def keep_awake(on: bool):
         ctypes.windll.kernel32.SetThreadExecutionState(es_continuous | (es_system_required if on else 0))
 
 
-def run_batch(todo, durations, log_path, model_name="large-v3-turbo", compute_type="int8_float16",
-              on_event=lambda kind, **info: None, should_stop=lambda: False, skip_existing=True, fast=False):
+def run_batch(todo, durations, log_path, model_name="large-v3-turbo", compute_type=None,
+              on_event=lambda kind, **info: None, should_stop=lambda: False, skip_existing=True, fast=False,
+              language=None, device="auto"):
     """Transcribe each video in `todo`, reporting through on_event(kind, **info).
 
     fast=True uses faster-whisper's batched mode: about 2.5x faster, slightly less accurate.
+    language is a code from LANGUAGES, or None to detect it per video (from its first chunk).
+    device is "cuda", "cpu" or "auto"; compute_type defaults to COMPUTE_TYPES[device].
 
     Events: loading, start, progress, done, skipped, failed, finished. A stop request abandons
     the current file (no .srt is written for it); a GPU error stops the batch.
@@ -293,22 +335,25 @@ def run_batch(todo, durations, log_path, model_name="large-v3-turbo", compute_ty
     durations = dict(durations)  # corrected below with each file's decoded length
     total_audio = sum(durations.values())
     keep_awake(True)
-    log_batch(f"START  {len(todo)} videos, {fmt_dur(total_audio)} of audio, "
-              f"model {model_name}{', fast mode' if fast else ''}, in {log_path.parent}")
     try:
         add_cuda_dll_dirs()
+        device = resolve_device(device)
+        compute_type = compute_type or COMPUTE_TYPES[device]
+        first = todo[0].parent if todo else ""
+        log_batch(f"START  {len(todo)} videos, {fmt_dur(total_audio)} of audio, model {model_name} on {device}, "
+                  f"language {language or 'auto'}{', fast mode' if fast else ''}, in {first}")
         from faster_whisper import WhisperModel
-        on_event("loading", model=model_name)
-        model = WhisperModel(model_name, device="cuda", compute_type=compute_type)
+        on_event("loading", model=model_name, device=device)
+        model = WhisperModel(model_name, device=device, compute_type=compute_type)
         if fast:
             from faster_whisper import BatchedInferencePipeline
             batched = BatchedInferencePipeline(model=model)
 
-            def transcribe(audio):
-                return batched.transcribe(audio, language="en", word_timestamps=True, batch_size=8, beam_size=5)
+            def transcribe(audio, lang):
+                return batched.transcribe(audio, language=lang, word_timestamps=True, batch_size=8, beam_size=5)
         else:
-            def transcribe(audio):
-                return model.transcribe(audio, language="en", vad_filter=True, word_timestamps=True,
+            def transcribe(audio, lang):
+                return model.transcribe(audio, language=lang, vad_filter=True, word_timestamps=True,
                                         condition_on_previous_text=False, beam_size=5)
 
         done_audio, ok, failures, stopped, gpu_error = 0.0, 0, 0, False, None
@@ -331,10 +376,11 @@ def run_batch(todo, durations, log_path, model_name="large-v3-turbo", compute_ty
                 dur = len(audio) / SR
                 total_audio += dur - durations[vid]  # the scan's ffprobe value may be off (0 if it failed)
                 durations[vid] = dur
-                words = []
+                words, lang = [], language
                 for a, b in chunk_bounds(audio):
                     offset = a / SR
-                    segments, _ = transcribe(audio[a:b])
+                    segments, info = transcribe(audio[a:b], lang)
+                    lang = lang or info.language  # detected once, then kept for the video's other chunks
                     for seg in segments:
                         if should_stop():
                             stopped = True
@@ -360,7 +406,7 @@ def run_batch(todo, durations, log_path, model_name="large-v3-turbo", compute_ty
                 ok += 1
                 took = time.time() - t_file
                 log_history(f"  OK       {vid}  ({fmt_dur(dur)} of audio in {fmt_dur(took)}, "
-                            f"{dur / max(took, 0.001):.1f}x realtime)")
+                            f"{dur / max(took, 0.001):.1f}x realtime, language {lang})")
                 on_event("done", n=n, video=vid, srt=srt)
             except Exception as e:
                 failures += 1
@@ -390,7 +436,7 @@ def run_batch(todo, durations, log_path, model_name="large-v3-turbo", compute_ty
 
 def print_event(kind, **e):
     if kind == "loading":
-        print(f"Loading model {e['model']} on GPU ...")
+        print(f"Loading model {e['model']} on {'GPU' if e['device'] == 'cuda' else 'CPU'} ...")
     elif kind == "start":
         print(f"\n[{e['n']}/{e['total']}] {e['video'].name}  ({fmt_dur(e['duration'])})")
     elif kind == "progress":
@@ -421,15 +467,21 @@ def main():
     ap = argparse.ArgumentParser(description="Batch-caption videos to .srt with faster-whisper.")
     ap.add_argument("inputs", nargs="+", help="folders and/or video files")
     ap.add_argument("--model", default="large-v3-turbo")
-    ap.add_argument("--compute-type", default="int8_float16")
+    ap.add_argument("--language", default="auto", choices=["auto", *LANGUAGES], metavar="CODE",
+                    help="spoken language, e.g. en, de, es (default: auto-detect per video)")
+    ap.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"],
+                    help="auto = NVIDIA GPU if available, else CPU (much slower)")
+    ap.add_argument("--compute-type", default=None, help="CTranslate2 precision (default: int8_float16 on GPU, int8 on CPU)")
     ap.add_argument("--force", action="store_true", help="redo videos that already have .srt")
     ap.add_argument("--fast", action="store_true", help="batched mode: about 2.5x faster, slightly less accurate")
     args = ap.parse_args()
 
-    problems = check_prerequisites()
+    problems = check_prerequisites(args.device)
     if problems:
         print("Cannot start:\n" + "\n".join(f"  - {p}" for p in problems))
         return 1
+    if resolve_device(args.device) == "cpu":
+        print("Note: running on the CPU (no NVIDIA GPU found or --device cpu). This is much slower than a GPU.")
 
     for line in unfinished_batches():
         print(f"Note: a previous run ended without finishing (crash, power loss or window closed):\n  {line}")
@@ -447,8 +499,9 @@ def main():
     print(f"Audio to transcribe: {fmt_dur(sum(durations.values()))}")
 
     try:
-        failures = run_batch(todo, durations, error_log_path(args.inputs[0]), args.model, args.compute_type,
-                             on_event=print_event, skip_existing=not args.force, fast=args.fast)
+        failures = run_batch(todo, durations, ERROR_LOG, args.model, args.compute_type,
+                             on_event=print_event, skip_existing=not args.force, fast=args.fast,
+                             language=None if args.language == "auto" else args.language, device=args.device)
     except KeyboardInterrupt:
         print("\nStopped. Rerun to continue where you left off.")
         return 130
