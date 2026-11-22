@@ -10,6 +10,7 @@ Read [`CONTEXT.md`](../CONTEXT.md) first for the vocabulary (Video, Caption file
 | `batscribe_gui.py` | Tkinter window (with `tkinterdnd2` for drag and drop). Imports `batscribe as bs` and only adds UI. Windows-only (`winsound`, `ctypes.windll`). |
 | `captions.bat` | Drag-and-drop wrapper: runs `batscribe.py` with the venv's Python and pauses at the end. |
 | `create_shortcut.ps1` | Creates `Batscribe.lnk` (app folder + Start menu) with the icon and AppUserModelID. Machine-specific, so `*.lnk` is gitignored. |
+| `make_icon.py` | Draws `batscribe.png` and `batscribe.ico` (quill on blue tile). Needs Pillow, which is not in `requirements.txt`. |
 | `tests/test_batscribe.py` | Unit tests with a fake model and fake audio. No GPU, ffmpeg or media needed. |
 | `requirements.txt` | Exact pinned versions known to work (Python 3.12, Windows). |
 
